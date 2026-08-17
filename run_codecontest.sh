@@ -14,7 +14,7 @@ set -ex
 # Prepare datasets first (downloads from HuggingFace and extracts tasks):
 # uv run examples/train_integrations/harbor/prepare_harbor_dataset.py --dataset open-thoughts/CodeContests
 # uv run examples/train_integrations/harbor/prepare_harbor_dataset.py --dataset open-thoughts/OpenThoughts-TB-dev
-DATA_DIR="/local_data/rusevich/llm/skyrl/data/harbor"
+DATA_DIR="/local_data/rusevich/llm/skyrl/data/harbor" # NO, DON'T USE THIS, USE DEFAULT, SO MANY ISSUES
 TRAIN_DATA="['$DATA_DIR/CodeContests']"
 EVAL_DATA="['$DATA_DIR/OpenThoughts-TB-dev']"
 
