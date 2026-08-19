@@ -10,7 +10,7 @@ set -euo pipefail
 WORK=/local_data/rusevich/llm/skyrl-singularity
 SIF="$WORK/sif/skyrl.sif"
 REPO_DIR="$WORK/SkyRL"
-GPUS=2,3,4,5
+GPUS=3,4,5
 
 #-----------------------
 # Dataset setup
@@ -35,10 +35,10 @@ HARBOR_TRIAL_CONFIG="singularity"
 #-----------------------
 # Training setup
 #-----------------------
-MODEL_PATH="Qwen/Qwen3-8B"
-SERVED_NAME="Qwen3-8B"
+MODEL_PATH="Qwen/Qwen3-1.7B"
+SERVED_NAME="Qwen3-1.7B"
 
-N_SAMPLES_PER_PROMPT=1
+N_SAMPLES_PER_PROMPT=8
 MINI_BATCH_SIZE=4
 MAX_MODEL_LEN=32768
 EVAL_INTERVAL=5
@@ -52,12 +52,14 @@ APPLY_OVERLONG_FILTERING=true
 #-----------------------
 NUM_POLICY_GPUS=2
 NUM_INFERENCE_ENGINES=1
-TP_SIZE=2
+TP_SIZE=1
 COLOCATE_ALL=false
 
 ENABLE_RATE_LIMITING=true
 TRAJECTORIES_PER_SECOND=1
 MAX_CONCURRENCY=8
+
+NUM_REF_GPUS=1
 
 #### DEBUG
 UV_HTTP_TIMEOUT=15
@@ -97,12 +99,16 @@ uv run --isolated --extra fsdp --extra harbor \
   trainer.export_path=$EXPORTS_DIR \
   trainer.ckpt_path=$CKPTS_DIR \
   trainer.log_path=$LOG_DIR \
-  trainer.strategy=fsdp \
+  trainer.strategy=fsdp2 \
+  trainer.policy.fsdp_config.reshard_after_forward=true \
+  trainer.ref.fsdp_config.reshard_after_forward=true \
   trainer.algorithm.advantage_estimator=$ADVANTAGE_ESTIMATOR \
   trainer.algorithm.max_seq_len=$MAX_MODEL_LEN \
+  trainer.algorithm.use_kl_loss=false \
+  trainer.algorithm.use_kl_in_reward=false \
   trainer.placement.colocate_all=$COLOCATE_ALL \
   trainer.placement.policy_num_gpus_per_node=$NUM_POLICY_GPUS \
-  trainer.placement.ref_num_gpus_per_node=$NUM_POLICY_GPUS \
+  trainer.placement.ref_num_gpus_per_node=$NUM_REF_GPUS \
   trainer.train_batch_size=$MINI_BATCH_SIZE \
   trainer.policy_mini_batch_size=$MINI_BATCH_SIZE \
   trainer.micro_forward_batch_size_per_gpu=1 \
@@ -113,12 +119,14 @@ uv run --isolated --extra fsdp --extra harbor \
   trainer.logger=wandb \
   trainer.project_name=harbor \
   trainer.run_name=$RUN_NAME \
+  generator.step_wise_trajectories=true \
   generator.inference_engine.backend=vllm \
   generator.inference_engine.run_engines_locally=true \
   generator.inference_engine.served_model_name=$SERVED_NAME \
   generator.inference_engine.num_engines=$NUM_INFERENCE_ENGINES \
   generator.inference_engine.tensor_parallel_size=$TP_SIZE \
   generator.inference_engine.engine_init_kwargs.max_model_len=$MAX_MODEL_LEN \
+  generator.inference_engine.gpu_memory_utilization=0.6 \
   generator.n_samples_per_prompt=$N_SAMPLES_PER_PROMPT \
   generator.apply_overlong_filtering=$APPLY_OVERLONG_FILTERING \
   generator.rate_limit.enabled=$ENABLE_RATE_LIMITING \

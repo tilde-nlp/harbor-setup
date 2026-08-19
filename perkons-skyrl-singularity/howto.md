@@ -95,6 +95,21 @@ ls "$DST" | wc -l
 
 OpenThoughts has an interesting format, it's not possible to modify tasks' task.toml directly because of that.
 
+
+### ???. (secret step) Download tmux for tasks (CodeContests specific)
+
+```bash
+mkdir -p "$WORK/docker"
+cat > "$WORK/docker/tmux.Dockerfile" <<'EOF'
+ARG BASE
+FROM ${BASE}
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tmux \
+ && rm -rf /var/lib/apt/lists/*
+EOF
+```
+
+
 ### 5. Patch images (CodeContests)
 CodeContest has one image for each task, because of that we can use the same container for each task.
 
@@ -105,14 +120,16 @@ IMG_DIR=$WORK/sif/images
 mkdir -p "$IMG_DIR" "$WORK/tmp"
 
 ENV_DIR=$(find "$DS" -mindepth 2 -maxdepth 2 -type d -name environment | head -n1)
-docker build -t harbor-env:codecontests "$ENV_DIR"
+docker build -t harbor-env:codecontests-base "$ENV_DIR"
+docker build --build-arg BASE=harbor-env:codecontests-base \
+             -t harbor-env:codecontests \
+             -f "$WORK/docker/tmux.Dockerfile" "$WORK/docker"
 docker save harbor-env:codecontests -o "$WORK/tmp/cc.tar"
 singularity build --force "$IMG_DIR/codecontests.sif" "docker-archive://$WORK/tmp/cc.tar"
 rm -f "$WORK/tmp/cc.tar"
 
 python3 patch_images.py --dataset "$DS" --image "$IMG_DIR/codecontests.sif"
 ```
-
 
 ### 6. Patch images (OpenThoughts)
 
@@ -160,7 +177,10 @@ for i in "${!TASKS[@]}"; do
         echo "[$((i+1))/$N] skip $name"
     else
         echo "[$((i+1))/$N] $(date +%T) building $name"
-        if docker build -t "harbor-env:$name" "$task/environment" &&
+        if docker build -t "harbor-env:$name-base" "$task/environment" &&
+           docker build --build-arg BASE="harbor-env:$name-base" \
+                        -t "harbor-env:$name" \
+                        -f "$WORK/docker/tmux.Dockerfile" "$WORK/docker" &&
            docker save "harbor-env:$name" -o "$TMP/$name.tar" &&
            singularity build --force --disable-cache "$sif" "docker-archive://$TMP/$name.tar"
         then
@@ -183,7 +203,11 @@ echo "built $(wc -l < "$MANIFEST")/$N, failed $FAILED -> $MANIFEST"
 python3 patch_images.py --dataset "$DS" --manifest "$MANIFEST"
 ```
 
-### 7. Modify the launch script and run
+### 7. Switch harbor config
+
+In the $WORK/SkyRL/examples/train_integrations/harbor/harbor_trial_config directory, add the singularity.yaml file
+
+### 9. Modify the launch script and run
 
 ```bash
 # Make sure to change variables, especially available gpus
