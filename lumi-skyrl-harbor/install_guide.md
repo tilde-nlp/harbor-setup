@@ -95,11 +95,11 @@ uv pip install --python /opt/venv/bin/python --dry-run \
   -c /opt/constraints.txt "ray[default]==2.56.0" orjson torchdata
 
 uv pip install --python /opt/venv/bin/python --dry-run \
-  -c /opt/constraints.txt -e /opt/SkyRL/SkyRL/skyrl-gym
+  -c /opt/constraints.txt -e /opt/SkyRL/skyrl-gym
 
 uv pip install --python /opt/venv/bin/python --dry-run \
   -c /opt/constraints.txt --overrides /opt/overrides.txt --no-build-isolation \
-  -e "/opt/SkyRL/SkyRL[megatron,tinker]"
+  -e "/opt/SkyRL[megatron,tinker]"
 
 
 ### INSTALLING MBRIDGE AND MCORE NOW
@@ -120,7 +120,7 @@ cp -a mcore mbridge multitorch_sandbox/opt/src/
 # dry runs, last time i promise:
 uv pip install --python /opt/venv/bin/python --dry-run \
   -c /opt/constraints.txt --overrides /opt/overrides.txt --no-build-isolation \
-  -e "/opt/SkyRL/SkyRL[megatron,tinker]"
+  -e "/opt/SkyRL[megatron,tinker]"
 
 uv pip install --python /opt/venv/bin/python --dry-run --no-deps --no-build-isolation \
   /opt/src/mcore
@@ -137,11 +137,11 @@ uv pip install --python /opt/venv/bin/python \
   -c /opt/constraints.txt "ray[default]==2.56.0" orjson torchdata
 
 uv pip install --python /opt/venv/bin/python \
-  -c /opt/constraints.txt -e /opt/SkyRL/SkyRL/skyrl-gym
+  -c /opt/constraints.txt -e /opt/SkyRL/skyrl-gym
 
 uv pip install --python /opt/venv/bin/python \
   -c /opt/constraints.txt --overrides /opt/overrides.txt --no-build-isolation \
-  -e "/opt/SkyRL/SkyRL[megatron,tinker]"
+  -e "/opt/SkyRL[megatron,tinker]"
 
 # swap megatron-core
 # explanation: we need megatron, but laifs already packaged it. with old version though.
@@ -164,22 +164,22 @@ uv pip install --python /opt/venv/bin/python \
 python -c "import megatron.bridge; print(megatron.bridge.__version__)" # check
 
 
-### WE ALSO NEED TRANSFORMERENGINE WTFFFF
-# host
-git clone --recursive https://github.com/ROCm/TransformerEngine te
-rm -rf te/.git
-cp -a te multitorch_sandbox/opt/src/te
+# transofrmer_engine is included in the multitorch-plus container
+# ### WE ALSO NEED TRANSFORMERENGINE WTFFFF
+# # host
+# git clone --recursive https://github.com/ROCm/TransformerEngine te
+# rm -rf te/.git
+# cp -a te multitorch_sandbox/opt/src/te
 
-salloc -A project_465003062 -p small -N1 -n1 -c32 --mem=96G -t 4:00:00
-srun --pty bash
+# salloc -A project_465003062 -p small -N1 -n1 -c32 --mem=96G -t 4:00:00
+# srun --pty bash
 
-# inside sandbox
-cd /opt/src/te
-export NVTE_FRAMEWORK=pytorch
-export NVTE_ROCM_ARCH=gfx90a PYTORCH_ROCM_ARCH=gfx90a
-pip install --no-deps --no-build-isolation -v .
-python -c "import transformer_engine.pytorch as te; import transformer_engine; print(transformer_engine.__version__)"
-
+# # inside sandbox
+# cd /opt/src/te
+# export NVTE_FRAMEWORK=pytorch
+# export NVTE_ROCM_ARCH=gfx90a PYTORCH_ROCM_ARCH=gfx90a
+# pip install --no-deps --no-build-isolation -v .
+# python -c "import transformer_engine.pytorch as te; import transformer_engine; print(transformer_engine.__version__)"
 
 
 # veryfying that we installed everything
@@ -201,7 +201,119 @@ diff /opt/pre.txt /opt/post.txt   # additions + overrides + mcore swap only; tor
 ```
 
 
-### 5. Smoke test (can skip)
+### 5. Tinker smoke test (can skip)
 
 ```bash
+
 # inside the container
+python -c "import tinker; print(tinker.__version__)"   # expect 0.16.1 = confirmed
+
+# fix the pin in the amd pyproject copy (repo root, where you added the megatron extra)
+sed -i 's/"tinker==0.16.1"/"tinker>=0.19.0,<=0.24.1"/' /opt/SkyRL/pyproject.toml
+grep -n '"tinker' /opt/SkyRL/pyproject.toml
+
+# dry run, then real
+uv pip install --python /opt/venv/bin/python --dry-run \
+  -c /opt/constraints.txt "tinker==0.24.1"
+uv pip install --python /opt/venv/bin/python \
+  -c /opt/constraints.txt "tinker==0.24.1"
+
+# verify
+python -c "from tinker.proto import tinker_public_pb2; import tinker; print(tinker.__version__)"
+python -c "import skyrl.tinker.api; print('api ok')"
+
+
+# outside
+
+export ROOT=/scratch/project_465003062/environment/containers/skyrl-harbor
+mkdir -p $ROOT/hf $ROOT/logs $ROOT/wandb
+
+export HF_HOME=$ROOT/hf
+singularity run $ROOT/multitorch_sandbox bash -c \
+  '. /opt/venv/bin/activate; hf download Qwen/Qwen3-4B-Instruct-2507'
+
+
+# salloc
+salloc --account=project_465003062 --partition=dev-g \
+  --nodes=1 --gpus-per-node=4 --ntasks=1 --cpus-per-task=28 \
+  --mem=240G --time=2:00:00
+
+srun --overlap --pty \
+  singularity run -B /var/spool/slurmd,$ROOT $ROOT/multitorch_sandbox bash
+
+. /opt/venv/bin/activate
+export PYTHONNOUSERSITE=1
+export ROOT=/scratch/project_465003062/environment/containers/skyrl-harbor
+
+export HF_HOME=$ROOT/hf
+export HF_HUB_OFFLINE=1
+export TINKER_API_LOG_FILE=$ROOT/logs/tinker-api.log
+
+# node-local ramdisk, reclaimed at job end
+export SKYRL_HOME=/tmp
+export UV_PROJECT_ENVIRONMENT=/opt/venv
+export UV_CACHE_DIR=/tmp/uv-cache
+export SKYRL_DATABASE_URL=sqlite:////tmp/tinker.db
+export MIOPEN_USER_DB_PATH=/tmp/miopen-$USER
+export MIOPEN_CUSTOM_CACHE_DIR=/tmp/miopen-$USER
+export RAY_USAGE_STATS_ENABLED=0
+
+export TORCH_EXTENSIONS_DIR=$ROOT/cache/torch_extensions
+export HIP_VISIBLE_DEVICES=$ROCR_VISIBLE_DEVICES
+unset ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
+
+export RAY_EXPERIMENTAL_NOSET_HIP_VISIBLE_DEVICES=1 RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
+
+export WANDB_MODE=offline
+export WANDB_DIR=$ROOT/wandb
+export WANDB_CACHE_DIR=$ROOT/wandb/.cache
+export WANDB_CONFIG_DIR=$ROOT/wandb/.config
+
+export RAY_DEDUP_LOGS=0
+export RAY_LOG_TO_STDERR=1
+export VLLM_LOGGING_LEVEL=DEBUG
+
+python -c "import torch; print(torch.cuda.device_count())"            # expect 4
+uv run --active --no-sync --extra tinker --extra megatron python -c "pass"
+
+# ONE LINE FIX OF THE SOURCE CODE, I WONDER IF THIS WILL END WELL
+python - <<'EOF'
+from pathlib import Path
+p = Path("/scratch/project_465003062/environment/containers/skyrl-harbor/multitorch_sandbox/opt/SkyRL/skyrl/backends/skyrl_train/inference_servers/vllm_server_actor.py")
+s = p.read_text()
+old = "    sock = create_server_socket(sock_addr, reuse_port=False)"
+new = """    try:
+        sock = create_server_socket(sock_addr, reuse_port=False)
+    except TypeError:  # older vLLM: no reuse_port kwarg; binds without SO_REUSEPORT anyway
+        sock = create_server_socket(sock_addr)"""
+assert old in s, "call site not found"
+p.write_text(s.replace(old, new, 1))
+print("patched")
+EOF
+
+cd /opt/SkyRL/examples/train/amd
+
+unset HOST
+echo ${HOST:-empty}   # must print "empty"
+
+BACKEND=megatron \
+POLICY_NUM_GPUS_PER_NODE=2 \
+INFERENCE_NUM_ENGINES=2 \
+HOST=0.0.0.0 \
+bash run_tinker_server_amd.sh &
+
+python - <<'EOF'
+import urllib.request, time
+for _ in range(180):
+    try:
+        urllib.request.urlopen("http://localhost:9000/api/v1/healthz", timeout=2)
+        print("ready"); break
+    except Exception:
+        time.sleep(10)
+else:
+    raise SystemExit("server did not come up")
+EOF
+
+TINKER_BASE_URL=http://localhost:9000 TINKER_API_KEY=tml-dummy \
+python tinker_hello_world.py
+```
