@@ -225,17 +225,17 @@ python -c "import skyrl.tinker.api; print('api ok')"
 
 # outside
 
-export ROOT=/scratch/project_465003062/environment/containers/skyrl-harbor
+export ROOT=/scratch/project_465003062/environment/containers/fsdp-skyrl-harbor
 mkdir -p $ROOT/hf $ROOT/logs $ROOT/wandb
 
 export HF_HOME=$ROOT/hf
 singularity run $ROOT/multitorch_sandbox bash -c \
-  '. /opt/venv/bin/activate; hf download Qwen/Qwen3-4B-Instruct-2507'
+  '. /opt/venv/bin/activate; hf download Qwen/Qwen3-14B'
 
 
 # salloc
 salloc --account=project_465003062 --partition=dev-g \
-  --nodes=1 --gpus-per-node=4 --ntasks=1 --cpus-per-task=28 \
+  --nodes=1 --gpus-per-node=8 --ntasks=1 --cpus-per-task=32 \
   --mem=240G --time=2:00:00
 
 srun --overlap --pty \
