@@ -33,5 +33,5 @@ case "$ROLE" in
 esac
 
 echo "[$SLURMD_NODENAME] $ROLE @ $MY_IP: $RAY_CMD"
-exec singularity exec -B "${BINDS:-/var/spool/slurmd,$ROOT,/scratch/project_465002038}" "$SANDBOX" \
+exec singularity exec -B "${BINDS:-/var/spool/slurmd,/scratch/project_465003062,/scratch/project_465002038}" "$SANDBOX" \
   bash -c "source $SCRIPTS/skyrl_env.sh && ray stop --force >/dev/null 2>&1; $RAY_CMD"

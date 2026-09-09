@@ -73,7 +73,7 @@ done
 #    Ray head over TCP; GPU work happens in actors under the raylets, and those
 #    inherit the raylet's environment, not the driver's.
 #    run_gsm8k_2node.sh first waits until all GPUs have joined the cluster.
-export BINDS="/var/spool/slurmd,$ROOT,/scratch/project_465002038"
+export BINDS="/var/spool/slurmd,/scratch/project_465003062,/scratch/project_465002038"
 singularity exec -B "$BINDS" "$SANDBOX" \
   bash -c "source $SCRIPTS/skyrl_env.sh && bash $SCRIPTS/run_gsm8k_2node.sh"
 
