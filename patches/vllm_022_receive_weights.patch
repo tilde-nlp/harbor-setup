@@ -1,0 +1,28 @@
+--- a/skyrl/backends/skyrl_train/inference_servers/new_inference_worker_wrap.py
++++ b/skyrl/backends/skyrl_train/inference_servers/new_inference_worker_wrap.py
+@@ -232,20 +232,11 @@
+             _reload_spec_decode_drafter(self.model_runner, weights)
+             return loaded
+ 
+-        # vLLM 0.26 dropped the `load_weights` callback parameter from
+-        # WeightTransferEngine.receive_weights; the engines now call
+-        # `self.model.load_weights` directly. Retarget the engine at a proxy
+-        # whose load_weights is ours (so the spec-decode drafter still gets
+-        # reloaded), using vLLM's own set/reset_weight_update_target hooks.
+-        engine.set_weight_update_target(
+-            _LoadWeightsProxy(model, _load_weights),
+-            self.model_config,
+-        )
+-        try:
+-            with set_current_vllm_config(self.vllm_config), torch.device(self.device):
+-                engine.receive_weights(typed_update_info)
+-        finally:
+-            engine.reset_weight_update_target()
++        # LUMI: the container ships vLLM 0.22.1, whose receive_weights still
++        # takes the `load_weights` callback (dropped in 0.26). Call it the
++        # pre-0.26 way; this is the same code SkyRL had before commit 7b9c72b8.
++        with set_current_vllm_config(self.vllm_config), torch.device(self.device):
++            engine.receive_weights(typed_update_info, load_weights=_load_weights)
+ 
+         torch.accelerator.synchronize()
+         _empty_cuda_cache_rocm()

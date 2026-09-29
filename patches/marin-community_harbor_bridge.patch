@@ -1,0 +1,413 @@
+diff --git a/src/harbor/environments/apptainer/server.py b/src/harbor/environments/apptainer/server.py
+index 8526e85..99ca0a2 100644
+--- a/src/harbor/environments/apptainer/server.py
++++ b/src/harbor/environments/apptainer/server.py
+@@ -52,9 +52,63 @@ _stats = {
+     "jobs_completed": 0,
+     "jobs_errors": 0,
+     "worker_polls": 0,
++    "starts_deferred": 0,  # polls where a START was held back for a less-loaded node
+ }
+ _last_worker_poll = 0.0
+ 
++# Per-node bookkeeping for START placement: node_id -> {"last_poll", "capacity"}.
++# A node is "active" while it has polled within NODE_ACTIVE_SEC; only active nodes
++# take part in the least-loaded comparison, so a node that died or whose dispatcher
++# is blocked stops holding START jobs back from the others.
++_nodes: dict = {}
++NODE_ACTIVE_SEC = 30.0
++LIVE_STATES = (ENV_STARTING, ENV_READY, ENV_STOPPING)
++
++
++def _live_envs_by_node():
++    """Number of envs each node currently owns that still occupy a sandbox."""
++    counts: dict = {}
++    for env in _envs.values():
++        if env["state"] in LIVE_STATES and env.get("node_id"):
++            counts[env["node_id"]] = counts.get(env["node_id"], 0) + 1
++    return counts
++
++
++def _start_allowance(node_id, now):
++    """How many START jobs `node_id` may take from the general queue right now.
++
++    Placement rule (least-loaded): a node may take a START only while its live env
++    count is not above the lowest live count among the active nodes, and only while
++    it is below its own capacity. One START per poll, so that the other nodes get a
++    turn: with idle polling at <=2 s and a resubmit interval of ~0.5 s per trajectory
++    (SkyRL's rate limiter) this alternates cleanly. Returns 0 to hold back.
++
++    Before this rule the general queue was drained into whichever dispatcher polled
++    first, with `count` = its thread count, so one node could own the whole batch of
++    sandboxes while the others stayed idle.
++    """
++    live = _live_envs_by_node()
++    my_live = live.get(node_id, 0)
++    info = _nodes.get(node_id, {})
++    capacity = info.get("capacity")
++    if capacity is not None and my_live >= capacity:
++        return 0
++    active = [
++        n for n, i in _nodes.items() if (now - i["last_poll"]) < NODE_ACTIVE_SEC
++    ]
++    if not active:
++        return 1
++    min_live = min(live.get(n, 0) for n in active)
++    return 1 if my_live <= min_live else 0
++
++
++def _note_poll(node_id, capacity, now):
++    """Record that `node_id` polled; remember its capacity when it reports one."""
++    info = _nodes.setdefault(node_id, {"last_poll": now, "capacity": None})
++    info["last_poll"] = now
++    if capacity is not None:
++        info["capacity"] = capacity
++
+ 
+ def _new_id(prefix=""):
+     return prefix + uuid.uuid4().hex[:12]
+@@ -280,7 +334,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
+ 
+     # ---- Worker endpoints (called by Jusuf/JUWELS workers) ----
+ 
+-    def _handle_worker_get_job(self, worker_id):
++    def _handle_worker_get_job(self, worker_id, capacity=None):
+         """Worker polls for next job. Sticky routing by node (hostname prefix).
+         Returns immediately — no blocking, no long-polling."""
+         global _last_worker_poll
+@@ -291,6 +345,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
+             # Legacy workers include a numeric thread suffix. Dispatchers send
+             # the hostname directly, which may itself contain dashes.
+             node_id = _node_id_from_worker_id(worker_id)
++            _note_poll(node_id, capacity, _last_worker_poll)
+ 
+             job_id = None
+ 
+@@ -301,9 +356,12 @@ class BridgeHandler(BaseHTTPRequestHandler):
+                 if not wq:
+                     del _worker_queues[node_id]
+ 
+-            # 2. Check general queue (START jobs)
++            # 2. Check general queue (START jobs), least-loaded node first
+             if job_id is None and _job_queue:
+-                job_id = _job_queue.popleft()
++                if _start_allowance(node_id, _last_worker_poll) > 0:
++                    job_id = _job_queue.popleft()
++                else:
++                    _stats["starts_deferred"] += 1
+ 
+             if job_id is not None:
+                 job = _jobs[job_id]
+@@ -329,15 +387,20 @@ class BridgeHandler(BaseHTTPRequestHandler):
+             else:
+                 self._json({"job_id": None})
+ 
+-    def _handle_worker_get_jobs(self, worker_id, count):
++    def _handle_worker_get_jobs(self, worker_id, count, capacity=None):
+         """Batch endpoint: return up to `count` jobs at once for a node.
+-        Reduces SSH tunnel traffic — one request returns multiple jobs."""
++        Reduces SSH tunnel traffic — one request returns multiple jobs.
++
++        Sticky (exec/upload/download/stop) jobs are drained freely: they belong
++        to sandboxes this node already owns. START jobs are rationed by
++        _start_allowance so new sandboxes land on the least-loaded node."""
+         global _last_worker_poll
+         with _lock:
+             _stats["worker_polls"] += 1
+             _last_worker_poll = time.time()
+ 
+             node_id = worker_id  # dispatcher sends hostname as worker_id
++            _note_poll(node_id, capacity, _last_worker_poll)
+ 
+             jobs_out = []
+ 
+@@ -366,8 +429,19 @@ class BridgeHandler(BaseHTTPRequestHandler):
+                 if not wq:
+                     del _worker_queues[node_id]
+ 
+-            # 2. Fill from general queue (START jobs)
++            # 2. Fill from general queue (START jobs), least-loaded node first.
++            #    Re-evaluate the allowance after every START handed out, because
++            #    each one raises this node's live count.
++            if _job_queue and len(jobs_out) < count:
++                if _start_allowance(node_id, _last_worker_poll) == 0:
++                    _stats["starts_deferred"] += 1
+             while _job_queue and len(jobs_out) < count:
++                head = _jobs.get(_job_queue[0])
++                # Only START jobs create a sandbox; a non-START job that ended up in
++                # the general queue (stop on a still-pending env) is not rationed.
++                if head is None or head["type"] == JOB_START:
++                    if _start_allowance(node_id, _last_worker_poll) == 0:
++                        break
+                 job_id = _job_queue.popleft()
+                 job = _jobs.get(job_id)
+                 if job:
+@@ -403,9 +477,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
+                 job["state"] = "error"
+                 job["error_msg"] = data["error"]
+                 _stats["jobs_errors"] += 1
+-                # Update env state on start failure
++                # Update env state on start failure. A failed STOP also frees the
++                # node: worker.py pops the instance before attempting the stop, so
++                # the sandbox no longer counts against that node's live envs.
+                 env = _envs.get(job["env_id"])
+-                if env and job["type"] == JOB_START:
++                if env and job["type"] in (JOB_START, JOB_STOP):
+                     env["state"] = ENV_STOPPED
+             else:
+                 job["state"] = "done"
+@@ -441,6 +517,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
+                     env_summary[state] = sum(
+                         1 for e in _envs.values() if e["state"] == state
+                     )
++                live = _live_envs_by_node()
++                nodes = {
++                    n: {
++                        "live_envs": live.get(n, 0),
++                        "capacity": i["capacity"],
++                        "active": (now - i["last_poll"]) < NODE_ACTIVE_SEC,
++                        "last_poll_age_sec": round(now - i["last_poll"], 1),
++                    }
++                    for n, i in _nodes.items()
++                }
+                 self._json(
+                     {
+                         "envs": env_summary,
+@@ -451,6 +537,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
+                         "workers_alive": (now - _last_worker_poll) < 15
+                         if _last_worker_poll
+                         else False,
++                        "nodes": nodes,
+                         "stats": _stats.copy(),
+                     }
+                 )
+@@ -464,6 +551,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
+             # Batch endpoint: return multiple jobs at once
+             worker_id = "unknown"
+             count = 16
++            capacity = None
+             if "?" in self.path:
+                 params = dict(
+                     p.split("=", 1)
+@@ -472,10 +560,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
+                 )
+                 worker_id = params.get("worker_id", "unknown")
+                 count = int(params.get("count", "16"))
+-            self._handle_worker_get_jobs(worker_id, count)
++                # Max sandboxes this node will hold at once (worker.py --max-envs).
++                # Older workers omit it: then only the least-loaded rule applies.
++                if params.get("capacity"):
++                    capacity = int(params["capacity"])
++            self._handle_worker_get_jobs(worker_id, count, capacity)
+         elif self.path.startswith("/worker/get_job"):
+             # Single-job endpoint (backward compat)
+             worker_id = "unknown"
++            capacity = None
+             if "?" in self.path:
+                 params = dict(
+                     p.split("=", 1)
+@@ -483,7 +576,9 @@ class BridgeHandler(BaseHTTPRequestHandler):
+                     if "=" in p
+                 )
+                 worker_id = params.get("worker_id", "unknown")
+-            self._handle_worker_get_job(worker_id)
++                if params.get("capacity"):
++                    capacity = int(params["capacity"])
++            self._handle_worker_get_job(worker_id, capacity)
+         elif self.path == "/heartbeat":
+             with _lock:
+                 _last_worker_poll = time.time()
+@@ -558,7 +653,12 @@ def cleanup_loop():
+                         job["error_msg"] = f"Worker timeout ({elapsed:.0f}s)"
+                         _stats["jobs_errors"] += 1
+                         env = _envs.get(job["env_id"])
+-                        if env and env["state"] in (ENV_PENDING, ENV_STARTING):
++                        # A timed-out START or STOP leaves nothing usable on the
++                        # node; drop the env so it stops counting as live there.
++                        if env and (
++                            env["state"] in (ENV_PENDING, ENV_STARTING)
++                            or job["type"] == JOB_STOP
++                        ):
+                             env["state"] = ENV_STOPPED
+ 
+             # Reap stale ENV_READY envs (zombie leak fix).
+diff --git a/src/harbor/environments/apptainer/worker.py b/src/harbor/environments/apptainer/worker.py
+index bfaebf6..377d200 100644
+--- a/src/harbor/environments/apptainer/worker.py
++++ b/src/harbor/environments/apptainer/worker.py
+@@ -1629,6 +1629,49 @@ class ApptainerInstance:
+ _instances: dict = {}  # env_id -> ApptainerInstance
+ _instances_lock = threading.Lock()
+ 
++# Jobs currently being executed by this node's worker threads, by type, for the
++# periodic status line (see _status_loop). Guarded by _in_flight_lock.
++_in_flight: dict = {"start": 0, "exec": 0, "upload": 0, "download": 0, "stop": 0}
++_in_flight_lock = threading.Lock()
++
++
++def _in_flight_add(job_type, delta):
++    with _in_flight_lock:
++        _in_flight[job_type] = _in_flight.get(job_type, 0) + delta
++
++
++def _status_line(hostname, num_workers, job_queue):
++    """One-line snapshot of what this node is holding and doing right now."""
++    with _instances_lock:
++        live = len(_instances)
++    with _pool_lock:
++        pooled = sum(len(b) for b in _instance_pool.values())
++    with _in_flight_lock:
++        f = dict(_in_flight)
++    busy = sum(f.values())
++    return (
++        f"[{hostname}] status: sandboxes={live} live"
++        f" (+{f['start']} starting, +{pooled} pooled idle)"
++        f" | threads busy {busy}/{num_workers}"
++        f" (exec={f['exec']} upload={f['upload']} download={f['download']}"
++        f" stop={f['stop']}) | local queue={job_queue.qsize()}"
++    )
++
++
++def _status_loop(hostname, num_workers, job_queue, interval):
++    """Print the node status line every `interval` seconds, and immediately
++    whenever the live sandbox count changed since the last line."""
++    last_live = -1
++    last_print = 0.0
++    while True:
++        time.sleep(1.0)
++        with _instances_lock:
++            live = len(_instances)
++        now = time.time()
++        if live != last_live or (now - last_print) >= interval:
++            print(_status_line(hostname, num_workers, job_queue), flush=True)
++            last_live, last_print = live, now
++
+ 
+ # ============================================================================
+ # Instance reuse pool (opt-in via BRIDGE_INSTANCE_REUSE=1)
+@@ -1772,30 +1815,41 @@ def _pool_evictor_loop():
+                 )
+ 
+ 
+-def dispatcher_loop(bridge_url, node_id, job_queue, num_workers):
++def dispatcher_loop(bridge_url, node_id, job_queue, num_workers, max_envs):
+     """Single dispatcher thread per node: polls bridge, distributes jobs locally.
+ 
+     This reduces SSH tunnel traffic from N workers polling to 1 dispatcher polling.
+     Uses batch polling: requests up to num_workers jobs at once.
++
++    `max_envs` is reported to the bridge as this node's capacity: the bridge will
++    not hand this node a START job while it already owns that many sandboxes, and
++    among nodes under capacity it prefers the one with the fewest live sandboxes.
+     """
+-    print(f"[Dispatcher {node_id}] Starting, bridge={bridge_url}")
++    print(
++        f"[Dispatcher {node_id}] Starting, bridge={bridge_url}, capacity={max_envs}"
++    )
+     min_interval = 0.05  # Fast poll when jobs are flowing
+     max_interval = 2.0  # Slow poll when idle
+     idle_interval = 0.1
+ 
+     while True:
+         try:
+-            # Request a batch of jobs (up to number of idle workers)
++            # Request a batch of jobs (up to number of idle workers). Sticky jobs
++            # for sandboxes this node owns are always served; START jobs are
++            # rationed by the bridge, so a large `count` no longer means this
++            # node takes the whole batch of new sandboxes.
+             idle_count = max(1, num_workers - job_queue.qsize())
+             resp = http_get(
+-                f"{bridge_url}/worker/get_jobs?worker_id={node_id}&count={idle_count}",
++                f"{bridge_url}/worker/get_jobs?worker_id={node_id}"
++                f"&count={idle_count}&capacity={max_envs}",
+                 timeout=15,
+             )
+ 
+             if resp.get("error"):
+                 # Fallback to single-job endpoint if batch not supported
+                 resp = http_get(
+-                    f"{bridge_url}/worker/get_job?worker_id={node_id}",
++                    f"{bridge_url}/worker/get_job?worker_id={node_id}"
++                    f"&capacity={max_envs}",
+                     timeout=15,
+                 )
+                 if resp.get("error"):
+@@ -1859,6 +1913,7 @@ def worker_loop(
+             print(f"[Worker {worker_id}] Job {job_id}: {job_type} env={env_id}")
+ 
+             result_data = {"job_id": job_id}
++            _in_flight_add(job_type, 1)
+ 
+             try:
+                 if job_type == "start":
+@@ -1927,6 +1982,8 @@ def worker_loop(
+             except Exception as e:
+                 result_data["error"] = str(e)
+                 print(f"[Worker {worker_id}] Job {job_id} failed: {e}")
++            finally:
++                _in_flight_add(job_type, -1)
+ 
+             # Result posting still goes directly to bridge via HTTP
+             http_post(f"{bridge_url}/worker/result", result_data)
+@@ -1992,7 +2049,23 @@ def main():
+         "--staging-base", default="/tmp", help="Base dir for instance staging"
+     )
+     parser.add_argument("--num-workers", type=int, default=16)
++    parser.add_argument(
++        "--max-envs",
++        type=int,
++        default=None,
++        help="Max sandboxes this node holds at once (reported to the bridge as "
++        "capacity). Default: --num-workers. Size it by node memory: each env "
++        "gets override_memory_mb plus the apptainer instance overhead.",
++    )
+     parser.add_argument("--poll-interval", type=float, default=0.1)
++    parser.add_argument(
++        "--status-interval",
++        type=float,
++        default=30.0,
++        help="Seconds between '[host] status:' lines (live sandboxes, jobs in "
++        "flight, busy threads). Also printed whenever the sandbox count changes. "
++        "0 disables.",
++    )
+     parser.add_argument(
+         "--max-exec-output-chars",
+         type=int,
+@@ -2008,10 +2081,12 @@ def main():
+     os.makedirs(args.staging_base, exist_ok=True)
+ 
+     hostname = os.uname().nodename
++    max_envs = args.max_envs if args.max_envs is not None else args.num_workers
+     print(f"Starting {args.num_workers} workers + 1 dispatcher on {hostname}")
+     print(f"  Bridge: {args.bridge_url}")
+     print(f"  SIF cache: {args.sif_cache}")
+     print(f"  Staging: {args.staging_base}")
++    print(f"  Max envs (capacity reported to bridge): {max_envs}")
+     print(
+         f"  Architecture: 1 dispatcher polls bridge, {args.num_workers} workers consume locally"
+     )
+@@ -2026,7 +2101,7 @@ def main():
+     node_id = hostname
+     dispatcher = threading.Thread(
+         target=dispatcher_loop,
+-        args=(args.bridge_url, node_id, job_queue, args.num_workers),
++        args=(args.bridge_url, node_id, job_queue, args.num_workers, max_envs),
+         daemon=True,
+     )
+     dispatcher.start()
+@@ -2035,6 +2110,15 @@ def main():
+     # No-op when BRIDGE_INSTANCE_REUSE!=1; cheap to always start.
+     evictor = threading.Thread(target=_pool_evictor_loop, daemon=True)
+     evictor.start()
++
++    # Status reporter: "[host] status: sandboxes=N live ..." every --status-interval
++    # seconds and on every change of the live sandbox count.
++    if args.status_interval > 0:
++        threading.Thread(
++            target=_status_loop,
++            args=(hostname, args.num_workers, job_queue, args.status_interval),
++            daemon=True,
++        ).start()
+     if _pool_enabled():
+         print(
+             f"[{hostname}] Instance reuse pool ENABLED "

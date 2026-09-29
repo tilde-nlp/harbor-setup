@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=skyrl-gsm8k-14b
 #SBATCH --account=project_465003062
-#SBATCH --partition=standard-g        # dev-g works too if its node/time limits allow 2 nodes
+#SBATCH --partition=dev-g        # dev-g works too if its node/time limits allow 2 nodes
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1           # one Ray process tree per node
 #SBATCH --gpus-per-node=8
