@@ -11,5 +11,6 @@ wheels/
 
 # Project
 .env
+unpack.sh
 
 *.zip

@@ -1,5 +1,6 @@
---- a/skyrl/backends/skyrl_train/inference_servers/new_inference_worker_wrap.py
-+++ b/skyrl/backends/skyrl_train/inference_servers/new_inference_worker_wrap.py
+diff -ruN -x .git -x __pycache__ -x '*.egg-info' -x '*.pyc' a/skyrl/backends/skyrl_train/inference_servers/new_inference_worker_wrap.py b/skyrl/backends/skyrl_train/inference_servers/new_inference_worker_wrap.py
+--- a/skyrl/backends/skyrl_train/inference_servers/new_inference_worker_wrap.py	2026-09-30 16:06:50.000000000 +0300
++++ b/skyrl/backends/skyrl_train/inference_servers/new_inference_worker_wrap.py	2026-09-28 13:30:20.000000000 +0300
 @@ -232,20 +232,11 @@
              _reload_spec_decode_drafter(self.model_runner, weights)
              return loaded

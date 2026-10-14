@@ -1,0 +1,4 @@
+# uv --overrides: laifs ships newer versions than SkyRL's pins; keep the LUMI builds.
+transformers>=5.6.1
+peft>=0.18.1
+debugpy>=1.8.0

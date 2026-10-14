@@ -1,0 +1,12 @@
+diff -ruN -x .git -x __pycache__ -x '*.egg-info' -x '*.pyc' a/skyrl/backends/skyrl_train/inference_servers/vllm_router.py b/skyrl/backends/skyrl_train/inference_servers/vllm_router.py
+--- a/skyrl/backends/skyrl_train/inference_servers/vllm_router.py	2026-09-30 15:50:33.000000000 +0300
++++ b/skyrl/backends/skyrl_train/inference_servers/vllm_router.py	2026-09-16 16:08:36.000000000 +0300
+@@ -124,7 +124,7 @@
+         router_url = f"http://{ip}:{self._router_args.port}"
+         self._wait_until_healthy(router_url)
+ 
+-        is_pd = self._router_args.vllm_pd_disaggregation or self._router_args.pd_disaggregation
++        is_pd = self._router_args.vllm_pd_disaggregation or getattr(self._router_args, "pd_disaggregation", False)
+         if is_pd:
+             logger.info(
+                 f"VLLMRouter (PD) started at {router_url}: "
