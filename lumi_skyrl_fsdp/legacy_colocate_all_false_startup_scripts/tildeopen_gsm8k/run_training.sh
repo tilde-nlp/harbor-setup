@@ -10,7 +10,7 @@ set -x
 
 # parallelism
 : "${TP:=4}"                                 # vLLM tensor parallel per engine; must divide GPUS_PER_NODE
-: "${SP:=1}"                                 # Ulysses sequence parallel for the policy; must divide policy GPUs
+: "${SP:=4}"                                 # Ulysses sequence parallel for the policy; must divide policy GPUs
 
 # model
 : "${ROOT:=/scratch/project_465003062/environment/containers/fsdp-skyrl-harbor}"
@@ -32,11 +32,11 @@ set -x
 : "${INFERENCE_BACKEND:=vllm}"
 
 # training
-: "${TRAIN_BS:=64}"                           # distinct tasks per step; multiple of MINI_BS
-: "${MINI_BS:=32}"                            # tasks per optimizer step
+: "${TRAIN_BS:=4}"                           # distinct tasks per step; multiple of MINI_BS
+: "${MINI_BS:=4}"                            # tasks per optimizer step
 : "${N_SAMPLES:=4}"                          # trajectories per task
-: "${MICRO_TRAIN_BS:=2}"                     # per DP rank, with grads
-: "${MICRO_FWD_BS:=4}"                       # per DP rank, forward only
+: "${MICRO_TRAIN_BS:=1}"                     # per DP rank, with grads
+: "${MICRO_FWD_BS:=1}"                       # per DP rank, forward only
 
 # logging
 : "${LOGGER:=console}"
@@ -181,6 +181,9 @@ ARGS=(
 
   trainer.update_epochs_per_batch=1
   # how many times to go over the same train batch (trainer.train_batch_size) before getting another batch
+
+  trainer.max_tokens_per_microbatch=65536
+  # IMPORTANT 
 
   trainer.algorithm.max_seq_len=$MAX_MODEL_LEN
   trainer.eval_batch_size=$TRAIN_BS

@@ -1,0 +1,20 @@
+diff --git a/vllm/distributed/weight_transfer/nccl_engine.py b/vllm/distributed/weight_transfer/nccl_engine.py
+index 3b04a5f65..748720cb9 100644
+--- a/vllm/distributed/weight_transfer/nccl_engine.py
++++ b/vllm/distributed/weight_transfer/nccl_engine.py
+@@ -340,5 +340,14 @@ class NCCLWeightTransferEngine(
+         pg = StatelessProcessGroup.create(
+             host=master_address, port=master_port, rank=rank, world_size=world_size
+         )
+-        pynccl = PyNcclCommunicator(pg, device=device)
++        # PyNcclCommunicator runs a warm-up all_reduce on current_stream(), which is
++        # the stream last recorded by the patched torch.cuda.set_stream in this
++        # thread and can be the null stream (handle 0). With RCCL + aws-ofi-rccl
++        # (libfabric/cxi, LUMI-G) a collective launched on the null stream by a
++        # rank that sends over the network never completes. Build the
++        # communicator under a dedicated stream so the warm-up never lands on the
++        # null stream; the context manager restores the previous stream on exit.
++        dev = torch.device(f"cuda:{device}") if isinstance(device, int) else torch.device(device)
++        with torch.cuda.stream(torch.cuda.Stream(device=dev)):
++            pynccl = PyNcclCommunicator(pg, device=device)
+         return pynccl

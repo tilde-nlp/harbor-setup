@@ -2,7 +2,7 @@
 #SBATCH --job-name=skyrl-tildeopen-gsm8k
 #SBATCH --account=project_465003062
 #SBATCH --partition=dev-g       
-#SBATCH --nodes=3
+#SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1           # one Ray process tree per node
 #SBATCH --gpus-per-node=8
 #SBATCH --cpus-per-task=56

@@ -2,13 +2,13 @@
 #SBATCH --job-name=skyrl-tildeopen-gsm8k
 #SBATCH --account=project_465003062
 #SBATCH --partition=dev-g       
-#SBATCH --nodes=3
+#SBATCH --nodes=4
 #SBATCH --ntasks-per-node=1           # one Ray process tree per node
 #SBATCH --gpus-per-node=8
 #SBATCH --cpus-per-task=56
 #SBATCH --mem=0
 #SBATCH --exclusive
-#SBATCH --time=02:00:00
+#SBATCH --time=01:00:00
 #SBATCH --output=%x-%j.out
 
 set -euo pipefail
@@ -79,7 +79,8 @@ echo "nodes: ${NODES[*]}   head: $HEAD_NODE ($RAY_ADDRESS)"
 #                visible which task printed "On head node" (must be exactly one).
 # --kill-on-bad-exit : any task failing (GPU assertion, ray start crash, timeout)
 #                kills the whole step instead of leaving the others waiting.
-srun --label --kill-on-bad-exit=1 \
+# setting mem=0 is important, especially when running on dev-g (OOM otherwise)
+srun --label --kill-on-bad-exit=1 --mem=0 \
      --nodes="$SLURM_JOB_NUM_NODES" --ntasks="$SLURM_JOB_NUM_NODES" --ntasks-per-node=1 \
      --gpus-per-node="$GPUS_PER_NODE" --cpus-per-task="$SLURM_CPUS_PER_TASK" \
      bash "$SCRIPTS/ray_symmetric.sh"
