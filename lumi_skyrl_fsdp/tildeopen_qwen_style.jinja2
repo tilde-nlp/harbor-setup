@@ -1,0 +1,129 @@
+{#-
+  Qwen3-style chat template for TildeOpen-30b (SkyRL + Harbor terminus-2, step-wise training).
+
+  Same structure as SkyRL's qwen3_acc_thinking.jinja2 (system block with optional tools,
+  user / assistant / tool turns, <tool_call> and <tool_response> wrapping, thinking kept in
+  the history), with these substitutions:
+
+    Qwen                         TildeOpen
+    <|im_start|>system\n         <|system|>\n          (special token from model.vocab)
+    <|im_start|>user\n           <|user|>\n
+    <|im_start|>assistant\n      <|assistant|>\n
+    <|im_end|> after assistant   <|assistant|><|endoftext|>  (the model's own turn ending; id 48 is its only EOS)
+    <|im_end|> after other turns \n                    (no trained end-of-message token exists)
+    <think> ... </think> tokens  <think> ... </think> as plain text
+
+  Thinking:
+    The vocabulary has no think tokens, so the tags are ordinary text. A base model does not
+    start thinking on its own, so the generation prompt pre-fills "<think>\n" (thinking on,
+    the default) or an empty "<think>\n\n</think>\n\n" block (enable_thinking=false), as Qwen
+    does for its non-thinking mode.
+
+  Step-wise merging (SkyRL merge_stepwise_output needs prompt[i] + response[i] to be a token
+  prefix of prompt[i+1]):
+    vLLM returns only the generated text, without the pre-filled "<think>\n". When a previous
+    assistant message is rendered again, the same pre-fill is put back in front of it, so the
+    re-rendered turn equals generation prompt + generated text + <|endoftext|>.
+    Previous thinking is never removed (the "acc" behaviour of the SkyRL template), because
+    removing it would break the prefix.
+-#}
+{%- set system_start = '<|system|>\n' -%}
+{%- set user_start = '<|user|>\n' -%}
+{%- set assistant_start = '<|assistant|>\n' -%}
+{%- set end_of_turn = '\n' -%}
+{#- The model closes its own turns with <|assistant|> then <|endoftext|> (seen in every turn
+    that ended in the probe run and in the hello-world run), so history uses the same ending. -#}
+{%- set end_of_assistant_turn = '<|assistant|><|endoftext|>' -%}
+{%- if enable_thinking is defined and enable_thinking is false -%}
+    {%- set think_prefill = '<think>\n\n</think>\n\n' -%}
+{%- else -%}
+    {%- set think_prefill = '<think>\n' -%}
+{%- endif -%}
+
+{#- Document start: <|endoftext|> is the tokenizer's bos_token, and add_bos_token is false. -#}
+{{- '<|endoftext|>' -}}
+
+{%- if tools -%}
+    {{- system_start -}}
+    {%- if messages[0].role == 'system' -%}
+        {{- messages[0].content + '\n\n' -}}
+    {%- endif -%}
+    {{- "# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" -}}
+    {%- for tool in tools -%}
+        {{- "\n" -}}
+        {{- tool | tojson -}}
+    {%- endfor -%}
+    {{- "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>" + end_of_turn -}}
+{%- else -%}
+    {%- if messages[0].role == 'system' -%}
+        {{- system_start + messages[0].content + end_of_turn -}}
+    {%- endif -%}
+{%- endif -%}
+
+{%- for message in messages -%}
+    {%- if message.content is string -%}
+        {%- set content = message.content -%}
+    {%- elif message.content is none -%}
+        {%- set content = '' -%}
+    {%- else -%}
+        {#- list content (OpenAI parts format): keep the text parts -#}
+        {%- set parts = namespace(text='') -%}
+        {%- for part in message.content -%}
+            {%- if part.type == 'text' -%}
+                {%- set parts.text = parts.text + part.text -%}
+            {%- endif -%}
+        {%- endfor -%}
+        {%- set content = parts.text -%}
+    {%- endif -%}
+
+    {%- if message.role == "user" or (message.role == "system" and not loop.first) -%}
+        {%- if message.role == "system" -%}
+            {{- system_start + content + end_of_turn -}}
+        {%- else -%}
+            {{- user_start + content + end_of_turn -}}
+        {%- endif -%}
+
+    {%- elif message.role == "assistant" -%}
+        {{- assistant_start -}}
+        {#- put back the pre-fill vLLM did not return, unless the content already has it -#}
+        {%- if not content.startswith('<think>') -%}
+            {{- think_prefill -}}
+        {%- endif -%}
+        {{- content -}}
+        {%- if message.tool_calls -%}
+            {%- for tool_call in message.tool_calls -%}
+                {%- if (loop.first and content) or (not loop.first) -%}
+                    {{- '\n' -}}
+                {%- endif -%}
+                {%- if tool_call.function -%}
+                    {%- set tool_call = tool_call.function -%}
+                {%- endif -%}
+                {{- '<tool_call>\n{"name": "' -}}
+                {{- tool_call.name -}}
+                {{- '", "arguments": ' -}}
+                {%- if tool_call.arguments is string -%}
+                    {{- tool_call.arguments -}}
+                {%- else -%}
+                    {{- tool_call.arguments | tojson -}}
+                {%- endif -%}
+                {{- '}\n</tool_call>' -}}
+            {%- endfor -%}
+        {%- endif -%}
+        {{- end_of_assistant_turn -}}
+
+    {%- elif message.role == "tool" -%}
+        {%- if loop.first or (messages[loop.index0 - 1].role != "tool") -%}
+            {{- user_start.rstrip('\n') -}}
+        {%- endif -%}
+        {{- '\n<tool_response>\n' -}}
+        {{- content -}}
+        {{- '\n</tool_response>' -}}
+        {%- if loop.last or (messages[loop.index0 + 1].role != "tool") -%}
+            {{- end_of_turn -}}
+        {%- endif -%}
+    {%- endif -%}
+{%- endfor -%}
+
+{%- if add_generation_prompt -%}
+    {{- assistant_start + think_prefill -}}
+{%- endif -%}

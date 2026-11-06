@@ -160,6 +160,7 @@ role_train() {
     # an option to share the gpus for inference/policy/critics etc. (WE DON'T USE colocate_all=true)
 
     trainer.strategy=fsdp
+    trainer.policy.fsdp_config.fsdp_size=16
     # distributed (multi-gpu/multi-node) training backend (another option - megatron, but that needs additional dependencies for this container)
 
     trainer.policy.sequence_parallel_size=$SP
