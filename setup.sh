@@ -1,15 +1,14 @@
 #!/usr/bin/env bash
-# Create a new working root (what a config's paths.root points at) from an existing, working one.
+# Turn this clone into a working root: put the container, model, HF cache and data next to the code,
+# taken from an existing, working root. The configs use the clone as paths.root (${derived.repo_dir}).
 #
-#   cd <new_root> && <repo>/setup.sh              new root = the current directory
-#   <repo>/setup.sh <new_root> [<from_root>]
-#   from_root defaults to the gsm8k/benchmark root below. Not covered (yet): Harbor (marin-harbor,
-#   sif_cache, singularity_cache, tasks, trials) - copy those by hand for a Harbor root.
+#   mkdir <dir> && cd <dir> && git clone <repo url> . && ./setup.sh [<from_root>]
+#   from_root defaults to the gsm8k/benchmark root below; for pregen use .../grpo-pregen-rl (its data/replay).
+#   Not covered (yet): Harbor (marin-harbor, sif_cache, singularity_cache, tasks, trials) - copy by hand.
 #
-# Then point a config at it: paths.root: <new_root>, or per run: ./submit.sh <config> paths.root=<new_root>
-# The new root must be under one of the config's paths.binds (e.g. /scratch/project_465003062).
-#
-# Safe to rerun: anything that already exists in <new_root> is left alone.
+# The clone must be under one of the configs' paths.binds (e.g. /scratch/project_465003062).
+# Everything this creates is git-ignored (.gitignore is a whitelist of the repo's own files).
+# Safe to rerun: anything that already exists is left alone.
 set -euo pipefail
 
 FROM_DEFAULT=/scratch/project_465003062/environment/containers/fsdp-skyrl-harbor
@@ -29,14 +28,11 @@ COPY=(
 MKDIR=(logs ckpts exports previous_runs)
 
 die() { echo "setup.sh: $*" >&2; exit 1; }
-REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
-NEW=$(realpath -m "${1:-$PWD}")
-FROM=$(realpath -m "${2:-$FROM_DEFAULT}")
-case "$NEW/" in "$REPO"/*) die "new root $NEW is inside this repo; cd to the new root first (or pass it as an argument)" ;; esac
+NEW=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)    # this clone
+FROM=$(realpath -m "${1:-$FROM_DEFAULT}")
 [ -d "$FROM" ] || die "source root $FROM does not exist"
-[ "$NEW" != "$FROM" ] || die "new root and source root are the same"
-mkdir -p "$NEW"
-echo "new root: $NEW"
+[ "$NEW" != "$FROM" ] || die "this clone is the source root"
+echo "root: $NEW"
 echo "from:     $FROM"
 
 for item in "${LINK[@]}" "${COPY[@]}"; do
@@ -66,4 +62,4 @@ for item in "${MKDIR[@]}"; do
   echo "  mkdir     $item/"
 done
 
-echo "done. Use it with:  paths.root: $NEW   (or ./submit.sh <config> paths.root=$NEW)"
+echo "done. Submit from here: ./submit.sh configs/<task>/<setup>.yaml"

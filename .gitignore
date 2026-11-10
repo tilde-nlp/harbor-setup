@@ -1,4 +1,16 @@
+# Whitelist: the clone is also the working root (setup.sh adds the container, model, hf, data; runs add
+# logs, ckpts, exports, previous_runs; Harbor adds marin-harbor, sif_cache, tasks, trials, ...).
+# Everything at the top level is ignored except the repo's own files: add new top-level files here.
+/*
+!/.gitignore
+!/README.md
+!/submit.sh
+!/setup.sh
+!/configs/
+!/launch/
+!/skyrl_extensions/
+!/setup/
+!/notes/
+
 __pycache__/
 *.py[oc]
-.venv
-.env

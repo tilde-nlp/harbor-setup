@@ -22,7 +22,7 @@ slurm:
   extra: []
 
 paths:
-  root: /scratch/project_465003062/environment/containers/grpo-pregen-rl
+  root: ${derived.repo_dir}               # this clone, populated by setup.sh
   sandbox: ${paths.root}/multitorch_sandbox.sif
   binds: [/var/spool/slurmd, /scratch/project_465003062, /scratch/project_465002038]
   hf_home: ${paths.root}/hf

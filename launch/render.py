@@ -82,7 +82,8 @@ def model_source(r):
                                           "models--" + path.replace("/", "--"), "snapshots", "*")))
     if snaps:
         return snaps[0].rstrip("/")
-    r.problem("model.path={}: neither a directory nor a hub id under {}/hub".format(path, r.get("paths.hf_home")))
+    r.problem("model.path={}: neither a directory nor a hub id under {}/hub{}".format(
+        path, r.get("paths.hf_home"), SETUP_HINT))
     return path
 
 
@@ -100,6 +101,7 @@ def inference_gpus(r):
     return r.get("layout.inference_nodes") * r.get("layout.gpus_per_node")
 
 
+SETUP_HINT = " (a fresh clone needs ./setup.sh first)"
 OPTIONAL_DERIVED = {"max_input_tokens"}  # only meaningful when the config has the keys they read
 DERIVED = {
     # layout
@@ -120,6 +122,7 @@ DERIVED = {
     "max_model_len": lambda r: min(r.get("model.max_model_len_cap"), r.derived("model_context")),
     "max_input_tokens": lambda r: r.derived("max_model_len") - r.get("skyrl.generator.sampling_params.max_generate_length"),
     # run
+    "repo_dir": lambda r: os.path.dirname(os.path.dirname(os.path.abspath(__file__))),  # this clone = the default root
     "config_name": lambda r: r.config_name,
     "run_id": lambda r: "{}-{}".format(r.timestamp, r.config_name),
     "run_dir": lambda r: os.path.join(r.get("paths.runs"), r.derived("run_id")),
@@ -184,6 +187,9 @@ class Resolver:
 
     def resolve_all(self):
         out = {section: self.get(section) for section in self.cfg}
+        sandbox = self.get("paths.sandbox")
+        if not os.path.exists(sandbox):
+            self.problem("container paths.sandbox={} not found{}".format(sandbox, SETUP_HINT))
         out["derived"] = {}
         for name in DERIVED:
             try:

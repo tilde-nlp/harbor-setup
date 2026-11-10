@@ -23,7 +23,9 @@ slurm:
   # nodes is never set: it is layout.policy_nodes + inference_nodes + ref_nodes
 
 paths:
-  root: /scratch/project_465003062/environment/containers/fsdp-skyrl-harbor
+  root: ${derived.repo_dir}
+  # the clone itself: setup.sh puts container, model, hf and data next to the code, and runs land here too.
+  # Another root for one run: ./submit.sh <config> paths.root=/scratch/...
   sandbox: ${paths.root}/multitorch_sandbox.sif   # the container (setup/BUILD_CONTAINER.md)
   binds: [/var/spool/slurmd, /scratch/project_465003062, /scratch/project_465002038]
   # singularity -B. The repo clone must be under one of these: the job runs the run dir's code snapshot
@@ -63,6 +65,7 @@ layout:
 #   served_name          basename of model.path (no '/': Harbor addresses hosted_vllm/<name>)
 #   model_context        max_position_embeddings;  max_model_len: min(cap, model_context)
 #   max_input_tokens     max_model_len - generator.sampling_params.max_generate_length
+#   repo_dir             this clone (default paths.root)
 #   config_name, run_id, run_dir, code_dir    this submission (code_dir: the code snapshot)
 #
 # checks run at submit time (launch/render.py): layout sums, tp | gpus_per_node, sp | policy GPUs,
