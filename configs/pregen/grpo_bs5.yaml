@@ -31,6 +31,8 @@ paths:
   ckpts: ${paths.root}/ckpts
   exports: ${paths.root}/exports
   runs: ${paths.root}/previous_runs
+  experiment: ${derived.config_name}      # names ckpts/ and exports/. One per arm (paths.experiment=retuned), or
+                                          # arms overwrite each other's exports and resume from each other's ckpts
 
 model:
   path: ${paths.root}/tildeopen           # must be the checkpoint that generated the rollouts
@@ -76,7 +78,7 @@ skyrl:
         adam_betas: [0.9, 0.999]
         num_warmup_steps: 10              # [SkyRL default: 0]
         offload_after_step: false         # [SkyRL default: true] keep optimizer state on GPU
-        # retuned arm if the band masks most tokens late: lr=3.0e-7 num_warmup_steps=60 adam_betas=[0.9,0.9999]
+        # retuned arm (+ paths.experiment=retuned) if the band masks most tokens late: lr=3.0e-7 num_warmup_steps=60 adam_betas=[0.9,0.9999]
     ref:
       sequence_parallel_size: ${layout.sp}
     algorithm:
@@ -105,8 +107,8 @@ skyrl:
     max_ckpts_to_keep: 1                  # [SkyRL default: -1]
     hf_save_interval: 432                 # [SkyRL default: -1] HF export at 1/3, 2/3, 3/3 of the data
     resume_mode: null                     # [SkyRL default: latest]
-    ckpt_path: ${paths.ckpts}/${skyrl.trainer.project_name}_${derived.served_name}
-    export_path: ${paths.exports}/${skyrl.trainer.project_name}
+    ckpt_path: ${paths.ckpts}/${skyrl.trainer.project_name}_${derived.served_name}_${paths.experiment}
+    export_path: ${paths.exports}/${skyrl.trainer.project_name}_${paths.experiment}
     log_path: ${paths.logs}
     logger: console                       # [SkyRL default: wandb]
     project_name: pregen_bs${skyrl.trainer.train_batch_size}

@@ -36,6 +36,9 @@ paths:
   exports: ${paths.root}/exports
   runs: ${paths.root}/previous_runs
   # one dir per submission: resolved config, SkyRL args, code snapshot, Slurm and NCCL logs; runs/latest
+  # experiment: ${derived.config_name}
+  # pregen only: suffix of trainer.ckpt_path and trainer.export_path. Set one per arm
+  # (paths.experiment=retuned); keep it on resume, or resume_mode=latest finds nothing
 
 model:
   path: ${paths.root}/tildeopen

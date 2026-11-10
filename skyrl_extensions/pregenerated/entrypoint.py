@@ -37,9 +37,13 @@ class NoInferenceClient:
     the trainer only calls sleep()/wake_up()/pause/resume on the client (trainer.py 381, 573), the
     generator never touches it, and the weight-sync group is skipped below. If a traceback shows
     the trainer reading a value from this object, add that one method explicitly.
+    Private and dunder names are not answered: copy/pickle/hasattr probes must see a normal object.
     """
 
     def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+
         async def _noop(*args, **kwargs):
             return None
         return _noop
@@ -73,7 +77,7 @@ class PregeneratedExp(BasePPOExp):
         assert alg.policy_loss_type == "rollout_is" and alg.use_kl_loss, (
             "pregenerated training needs trainer.algorithm.policy_loss_type=rollout_is and use_kl_loss=true"
         )
-        return PregeneratedGenerator(PregeneratedStore(cfg.data.train_data[0]))
+        return PregeneratedGenerator(PregeneratedStore(cfg.data.train_data[0], max_seq_len=alg.max_seq_len))
 
     def get_train_dataset(self):
         return PregeneratedDataset(self.cfg.data.train_data[0], self.cfg.generator.n_samples_per_prompt)

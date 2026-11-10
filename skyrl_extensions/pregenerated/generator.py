@@ -13,6 +13,7 @@ Interfaces, checked against skyrl/train/generators/base.py and generators/utils.
 import json
 from collections import Counter
 
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from loguru import logger
 
@@ -24,12 +25,31 @@ SCORE_MAX = 10.0  # stored scores are 0..10; GRPO sees 0..1 (the scale the KL co
 class PregeneratedStore:
     """All rollouts of the parquet as one Arrow table, indexed by (uid, rep)."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, max_seq_len: int = None):
         self.table = pq.read_table(path)
         keys = zip(self.table.column("uid").to_pylist(), self.table.column("rep").to_pylist())
         self.index = {k: i for i, k in enumerate(keys)}
         self.has_logprobs = "ref_logprobs" in self.table.column_names
+        self._validate(path, max_seq_len)
         logger.info(f"PregeneratedStore: {len(self.index)} rollouts from {path}")
+
+    def _validate(self, path, max_seq_len):
+        """Fail at start, not at step N: every check is one vectorized pass over the list lengths."""
+        t = self.table
+        if len(self.index) != t.num_rows:
+            raise ValueError(f"{path}: {t.num_rows - len(self.index)} duplicate (uid, rep) rows")
+        n_prompt, n_resp = pc.list_value_length(t["prompt_ids"]), pc.list_value_length(t["response_ids"])
+        per_token = ["loss_mask"] + (["ref_logprobs"] if self.has_logprobs else [])
+        for col in per_token:
+            bad = pc.sum(pc.not_equal(pc.list_value_length(t[col]), n_resp)).as_py() or 0
+            if bad or t[col].null_count:
+                raise ValueError(f"{path}: {bad} rows where len({col}) != len(response_ids), {t[col].null_count} null")
+        longest = pc.max(pc.add(n_prompt, n_resp)).as_py()
+        if max_seq_len is not None and longest > max_seq_len:
+            raise ValueError(
+                f"{path}: longest prompt + response is {longest} tokens, above trainer.algorithm.max_seq_len={max_seq_len}"
+            )
+        logger.info(f"PregeneratedStore: longest prompt + response {longest} tokens (max_seq_len {max_seq_len})")
 
     def get(self, uid: str, rep: int) -> dict:
         return self.table.slice(self.index[(uid, rep)], 1).to_pylist()[0]
@@ -43,6 +63,11 @@ class PregeneratedDataset:
         uids, reps, prompts = (t.column(c).to_pylist() for c in ("uid", "rep", "prompt"))
         bad = [u for u, c in Counter(uids).items() if c != n_samples_per_prompt]
         assert not bad, f"{len(bad)} prompts without exactly {n_samples_per_prompt} rollouts, e.g. {bad[:3]}"
+        # The generator looks up (uid, 0..n-1): with the count right, any rep outside that range means
+        # 1-based or duplicated reps, which would otherwise give an empty dataset or a KeyError mid-run.
+        bad = sorted({u for u, r in zip(uids, reps) if not 0 <= r < n_samples_per_prompt})
+        assert not bad, f"{len(bad)} prompts with rep outside 0..{n_samples_per_prompt - 1}, e.g. {bad[:3]}"
+        assert len(set(zip(uids, reps))) == len(uids), "duplicate (uid, rep) rows"
         self.items = [
             {"prompt": json.loads(p), "env_class": None, "env_extras": {"uid": u}, "uid": u}
             for u, r, p in zip(uids, reps, prompts)
