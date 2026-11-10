@@ -1,0 +1,116 @@
+# gsm8k train/inference log-prob mismatch, run 1 of 2: baseline, no correction.
+# = gsm8k.yaml + sampling pinned to the untruncated distribution + logprobs. Run 2: gsm8k_mismatch_opc.yaml.
+# Both log policy/rollout_train_logprobs_abs_diff_* and policy/minibatch_rollout_logprobs_abs_diff_*.
+# With train_batch_size == policy_mini_batch_size there is one optimizer step per batch: pure
+# trainer-vs-vLLM mismatch, no staleness. SP ablation (SP adds mismatch): layout.sp=1 (DP=16) or layout.sp=2
+#
+#   ./submit.sh [--dry-run] configs/single_step/gsm8k_mismatch_baseline.yaml [key.path=value ...]
+#
+# Self-contained. Meaning of every key and SkyRL's defaults: configs/REFERENCE.yaml.
+# SkyRL keys not listed keep the default; [SkyRL default: X] marks a value changed from it.
+
+slurm:
+  account: project_465003062
+  partition: dev-g
+  time: "01:00:00"
+  job_name: skyrl-${derived.config_name}
+  cpus_per_task: 56
+  extra: []
+
+paths:
+  root: /scratch/project_465003062/environment/containers/fsdp-skyrl-harbor
+  sandbox: ${paths.root}/multitorch_sandbox.sif
+  binds: [/var/spool/slurmd, /scratch/project_465003062, /scratch/project_465002038]
+  hf_home: ${paths.root}/hf
+  data: ${paths.root}/data
+  logs: ${paths.root}/logs
+  ckpts: ${paths.root}/ckpts
+  exports: ${paths.root}/exports
+  runs: ${paths.root}/previous_runs
+
+model:
+  path: ${paths.root}/tildeopen
+  max_model_len_cap: 65536
+
+layout:
+  gpus_per_node: 8
+  policy_nodes: 2
+  inference_nodes: 2
+  ref_nodes: 0
+  tp: 4
+  sp: 4
+  ray_port: 6379
+
+entrypoint:
+  module: skyrl.train.entrypoints.main_base
+  cwd: null
+
+env: {}
+
+skyrl:
+  data:
+    train_data: ["${paths.data}/train.parquet"]
+    val_data: ["${paths.data}/validation.parquet"]
+
+  trainer:
+    strategy: fsdp
+    logprobs_chunk_size: 512              # [SkyRL default: 1024]
+    placement:
+      colocate_all: false                 # [SkyRL default: true] vLLM on its own nodes
+      colocate_policy_ref: false          # [SkyRL default: true]
+      policy_num_nodes: ${layout.policy_nodes}
+      policy_num_gpus_per_node: ${layout.gpus_per_node}
+      ref_num_nodes: ${layout.ref_nodes}
+      ref_num_gpus_per_node: ${layout.gpus_per_node}
+      critic_num_nodes: ${layout.policy_nodes}
+      critic_num_gpus_per_node: ${layout.gpus_per_node}
+    policy:
+      model:
+        path: ${derived.model}
+      sequence_parallel_size: ${layout.sp}
+      fsdp_config:
+        fsdp_size: ${derived.policy_gpus}
+      optimizer_config:
+        lr: 1.0e-6
+    ref:
+      sequence_parallel_size: ${layout.sp}
+    algorithm:
+      advantage_estimator: grpo
+      loss_reduction: token_mean
+      use_kl_loss: false                  # [SkyRL default: true] no reference model
+      max_seq_len: ${derived.max_model_len}
+
+    epochs: 1
+    train_batch_size: 4                   # [SkyRL default: 1024] distinct prompts per step
+    policy_mini_batch_size: 4             # [SkyRL default: 256] prompts per optimizer step
+    micro_train_batch_size_per_gpu: 1
+    micro_forward_batch_size_per_gpu: 1
+    max_tokens_per_microbatch: 65536      # [SkyRL default: -1] token-budget micro batches
+    eval_batch_size: 4                    # [SkyRL default: 1024]
+    eval_before_train: false              # [SkyRL default: true]
+    eval_interval: -1                     # [SkyRL default: 5]
+    ckpt_interval: -1                     # [SkyRL default: 10]
+    resume_mode: null                     # [SkyRL default: latest]
+    ckpt_path: ${paths.ckpts}/${skyrl.trainer.project_name}_${derived.served_name}_ckpt
+    export_path: ${paths.exports}/${skyrl.trainer.project_name}
+    log_path: ${paths.logs}
+    logger: console                       # [SkyRL default: wandb]
+    project_name: gsm8k
+    run_name: ${skyrl.trainer.project_name}_lumi_${derived.num_nodes}n_${derived.served_name}_sp${layout.sp}_dp${derived.dp}_opc0
+
+  generator:
+    inference_engine:
+      num_engines: ${derived.num_engines}
+      tensor_parallel_size: ${layout.tp}
+      distributed_executor_backend: mp    # [SkyRL default: ray] ray may cause errors here
+      served_model_name: ${derived.served_name}
+      gpu_memory_utilization: 0.8
+      engine_init_kwargs:
+        max_model_len: ${derived.max_model_len}
+    n_samples_per_prompt: 4               # [SkyRL default: 5]
+    sampling_params:
+      max_generate_length: 2048           # [SkyRL default: 1024] per LLM call
+      temperature: 1.0                    # pinned: any truncation or temperature != 1 on the vLLM side
+      top_p: 1.0                          # is a systematic mismatch, not a kernel/precision effect
+      top_k: -1
+      logprobs: 0                         # [SkyRL default: 1] sampled token's log-prob, no extras

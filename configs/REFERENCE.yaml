@@ -1,0 +1,409 @@
+# =====================================================================================================
+# REFERENCE - not a runnable config.
+# What every key of the setup files means. Under `skyrl:` the values shown are SkyRL's defaults
+# (SkyRL 59d4dae, setup/versions.env; source of truth: /opt/SkyRL/skyrl/train/config/config.py in the
+# container). A setup file lists only what it sets; everything else keeps the default shown here.
+# To change something a setup does not list: find it here, add the line to the setup.
+# SkyRL rejects unknown keys, so a typo fails at job start (and `./submit.sh --dry-run` shows the args).
+#
+# Setup file syntax: ${a.b} = value of another key of the same file; ${derived.x} = computed by
+# launch/render.py (listed below and in every run's config.yaml).
+# =====================================================================================================
+
+# ----------------------------------------------------------------------------------------- LAUNCHER
+# (not SkyRL: read by launch/render.py, submit.sh and the job scripts)
+
+slurm:
+  account: project_465003062
+  partition: dev-g                # dev-g caps at 3 h (smoke runs); standard-g for long runs
+  time: "01:00:00"
+  job_name: skyrl-${derived.config_name}
+  cpus_per_task: 56
+  extra: []                       # any other sbatch flags, e.g. ["--reservation=foo"]
+  # nodes is never set: it is layout.policy_nodes + inference_nodes + ref_nodes
+
+paths:
+  root: /scratch/project_465003062/environment/containers/fsdp-skyrl-harbor
+  sandbox: ${paths.root}/multitorch_sandbox.sif   # the container (setup/BUILD_CONTAINER.md)
+  binds: [/var/spool/slurmd, /scratch/project_465003062, /scratch/project_465002038]
+  # singularity -B. The repo clone must be under one of these: the job runs the run dir's code snapshot
+  hf_home: ${paths.root}/hf       # HF_HOME; HF_HUB_OFFLINE=1, so download models beforehand
+  data: ${paths.root}/data
+  logs: ${paths.root}/logs
+  ckpts: ${paths.root}/ckpts
+  exports: ${paths.root}/exports
+  runs: ${paths.root}/previous_runs
+  # one dir per submission: resolved config, SkyRL args, code snapshot, Slurm and NCCL logs; runs/latest
+
+model:
+  path: ${paths.root}/tildeopen
+  # local HF dir, or a hub id already downloaded to hf_home. Every node copies it to node-local RAM
+  # (/tmp, sequential reads instead of mmap page faults on Lustre) before start: ${derived.model}
+  max_model_len_cap: 65536        # derived.max_model_len = min(cap, max_position_embeddings in config.json)
+
+layout:
+  gpus_per_node: 8                # GCDs per LUMI-G node
+  policy_nodes: 2                 # FSDP policy (trainer) nodes
+  inference_nodes: 2              # vLLM nodes; 0 when nothing is generated (pregen)
+  ref_nodes: 0                    # reference model nodes; 0 = none, or on the policy GPUs (pregen)
+  tp: 4
+  # vLLM tensor parallel per engine; must divide gpus_per_node (an engine never spans nodes)
+  sp: 4
+  # Ulysses sequence parallel for policy and ref; must divide the policy GPUs. Activation memory
+  # scales 1/SP (FSDP sharding does not reduce activations); a known source of train/infer mismatch
+  ray_port: 6379
+
+# derived (computed, usable as ${derived.x}):
+#   num_nodes            policy + inference + ref nodes (= sbatch --nodes)
+#   policy_gpus, ref_gpus, inference_gpus
+#   num_engines          inference_gpus / tp
+#   dp                   policy_gpus / sp (FSDP data-parallel ranks)
+#   ref_colocated        ref_nodes == 0;  ref_placement_nodes: ref_nodes, or policy_nodes when colocated
+#   model, model_src     staged /tmp copy, and the source dir it is copied from
+#   served_name          basename of model.path (no '/': Harbor addresses hosted_vllm/<name>)
+#   model_context        max_position_embeddings;  max_model_len: min(cap, model_context)
+#   max_input_tokens     max_model_len - generator.sampling_params.max_generate_length
+#   config_name, run_id, run_dir, code_dir    this submission (code_dir: the code snapshot)
+#
+# checks run at submit time (launch/render.py): layout sums, tp | gpus_per_node, sp | policy GPUs,
+# DP >= 2, the batch rule below, max_generate_length < max_model_len, Harbor concurrency <= workers
+
+entrypoint:
+  module: skyrl.train.entrypoints.main_base
+  # python -m <module> <skyrl args>, on the head node under ray. Others in use:
+  #   examples.train_scripts.full_context.main_full_ctx            (benchmark; adds trainer.num_dummy_steps)
+  #   examples.train_integrations.harbor.entrypoints.main_harbor   (adds harbor_trial_config, generator.rate_limit)
+  #   skyrl_extensions.pregenerated.entrypoint                     (ours, skyrl_extensions/)
+  cwd: null                       # /opt/SkyRL for modules under examples.*
+
+env: {}
+# extra variables on every node, applied after launch/lumi_env.sh (which explains every variable), e.g.
+#   NCCL_NET: Socket      transport; default Libfabric
+#   NCCL_DEBUG: WARN      default INFO with COLL: logs every collective, chatty
+
+harbor_env:                       # Harbor configs only: the environment-plane job (launch/harbor_env.sbatch)
+  submit: true                    # false: reuse another run's env job; point bridge_file at its run dir
+  bridge_file: ${derived.run_dir}/bridge.url
+  slurm: {partition: dev-g, nodes: 1, cpus_per_task: 16, mem: 32G, time: "${slurm.time}"}
+  workers_per_node: 8             # nodes x workers_per_node >= generator.rate_limit.max_concurrency
+  bridge_port: 9910
+  apptainer_dir: ${paths.root}/marin-harbor/src/harbor/environments/apptainer   # server.py, worker.py
+  sif_cache: ${paths.root}/sif_cache
+  singularity_cachedir: ${paths.root}/singularity_cache
+  use_fakeroot: 0
+  # BRIDGE_USE_FAKEROOT. LUMI has no fakeroot; "auto" would extract every SIF to a sandbox, fail,
+  # and retry on every start
+
+# ----------------------------------------------------------------------------------------- SKYRL
+skyrl:
+  data:
+    train_data: ["~/data/gsm8k/train.parquet"]
+    # parquet/json files or HF dataset names (Harbor: directories of task dirs). Loaded entirely into
+    # memory on the driver
+    val_data: ["~/data/gsm8k/validation.parquet"]
+    dataloader:
+      num_workers: null           # null = 8; 0 = in-process
+      persistent_workers: false
+
+  environment:
+    env_class: gsm8k              # skyrl-gym env computing the reward (each parquet row also names its env)
+
+  trainer:
+    # ---------------------------------------------------------------------------- backend
+    strategy: fsdp
+    # fsdp (FSDP2 fully_shard) or megatron (needs additional dependencies in this container)
+    sequence_parallel_backend: ulysses
+    seed: 42
+    bf16: true
+    flash_attn: true
+    gradient_checkpointing: true  # activation recomputation: trade compute for memory
+    use_expandable_segments: true # expandable_segments allocator on the trainer workers (less fragmentation)
+    logprobs_chunk_size: 1024
+    # chunk the sequence when computing log-probs from logits: lower peak memory, ~2x slower. FSDP needs > 0
+    remove_microbatch_padding: true
+    # pack samples (THD layout), no padding inside a micro batch. Without it every row is padded to the
+    # longest sequence of the batch (pregen step 1: 85k real tokens padded to 769k)
+
+    # ---------------------------------------------------------------------------- placement
+    placement:
+      colocate_all: true
+      # training and inference share the same GPUs. WE DON'T USE colocate_all=true: false puts vLLM on
+      # its own nodes and syncs weights over NCCL after every optimizer step
+      colocate_policy_ref: true
+      # policy and ref on the same GPUs (one placement group). The ref model only exists when
+      # algorithm.use_kl_loss or use_kl_in_reward is true
+      policy_num_nodes: 1
+      policy_num_gpus_per_node: 1
+      ref_num_nodes: 1
+      ref_num_gpus_per_node: 1
+      critic_num_nodes: 1         # critic: only with trainer.critic.model.path set (GAE)
+      critic_num_gpus_per_node: 1
+
+    # ---------------------------------------------------------------------------- policy
+    policy:
+      model:
+        path: Qwen/Qwen2.5-1.5B-Instruct   # HF dir or hub id. Setups use the staged /tmp copy: ${derived.model}
+        lora:
+          rank: 0                 # 0 = full fine-tuning; 8/16/32/64 train low-rank adapters
+          alpha: 16
+          dropout: 0.0
+          target_modules: all-linear
+      sequence_parallel_size: 1
+      fsdp_config:
+        fsdp_size: -1
+        # GPUs one copy of params/grads/optimizer is sharded over. -1 = all policy GPUs (full sharding);
+        # smaller = hybrid sharding with replicas (fullctx_11n: 16 GCDs x 5 replicas)
+        cpu_offload: false
+        # offload params and optimizer state to RAM. Avoid it like the plague
+        reshard_after_forward: true
+        # free gathered params after forward (ZeRO-3); false keeps them (ZeRO-2 like, more memory)
+      optimizer_config:           # AdamW
+        lr: 1.0e-6
+        adam_betas: [0.9, 0.999]
+        weight_decay: 0.01
+        max_grad_norm: 1.0        # gradient clipping (total L2 norm)
+        num_warmup_steps: 0       # optimizer steps
+        scheduler: constant_with_warmup   # any transformers.SchedulerType
+        offload_after_step: true
+        # offload optimizer state to CPU after each step; acts only under colocation (colocate_all or
+        # colocate_policy_ref). Without colocation keep it on GPU
+      use_torch_compile: false    # torch.compile the logits computation
+      record_memory: false        # memory snapshots to {ckpt_path}/memory_snapshots/ (pytorch.org/memory_viz)
+      torch_profiler_config:
+        enable: false
+        # policy workers only. Rejected under colocation with cpu_offload=false. To profile:
+        ranks: [0]                # e.g. [0, 1, 2, 3]
+        save_path: null           # required, absolute: ${derived.run_dir}/torch_profiler (/tmp is per node, wiped)
+        skip_first: 10            # lower it on a 1 h dev-g job, e.g. 0
+        wait: 0
+        warmup: 1
+        active: 1                 # steps recorded per window
+        repeat: 1                 # 0 = every window until the run ends
+        record_shapes: true
+        profile_memory: false     # per-op allocation in the trace
+        with_stack: true
+        export_type: chrome_trace # or stacks (flamegraph input)
+
+    # ---------------------------------------------------------------------------- reference
+    ref:
+      # frozen copy of the starting policy (model.path defaults to the policy path). Created only when
+      # algorithm.use_kl_loss or use_kl_in_reward is true. pregen: the behaviour policy of rollout_is
+      sequence_parallel_size: 1
+
+    # ---------------------------------------------------------------------------- critic
+    critic:
+      model:
+        path: null                # null = no critic (GRPO). A path enables a value model (GAE/PPO)
+
+    # ---------------------------------------------------------------------------- algorithm
+    algorithm:
+      advantage_estimator: grpo   # grpo, gae, rloo, reinforce++, or custom via AdvantageEstimatorRegistry
+      grpo_norm_by_std: true
+      # divide advantages by the group std. false = Dr. GRPO (advantage = score - group mean); true gives
+      # a {10,9,...,9} group the same +-2.6 advantages as a 10-vs-0 group
+      advantage_batch_normalize: false
+      zero_variance_filter: false # loss-mask prompt groups whose rewards are all equal
+      policy_loss_type: regular
+      # regular (PPO clip), dual_clip, gspo, clip_cov, kl_cov, cispo, sapo, dppo, cross_entropy,
+      # importance_sampling, rollout_is (GLM-5 4.1.2: banded ratio against the rollout policy with a
+      # stop-gradient weight, zero outside the band), or custom via PolicyLossRegistry.
+      # Loss-specific knobs live in algorithm.{sapo,cispo,dppo,clip_cov,kl_cov} (config.py)
+      eps_clip_low: 0.2           # PPO clip / rollout_is band: (1 - low, 1 + high)
+      eps_clip_high: 0.2
+      clip_ratio_c: 3.0           # dual_clip only
+      loss_reduction: token_mean
+      # token_mean (DAPO; required for step-wise training), sequence_mean, prompt_mean,
+      # seq_mean_token_sum_norm (Dr. GRPO, needs max_seq_len)
+      max_seq_len: null
+      # normalizer of seq_mean_token_sum_norm. Required by the Harbor entrypoint (responses are cut to it)
+      temperature: null           # null = generator.sampling_params.temperature (the trainer scales logits by it)
+      use_kl_loss: true           # policy_loss + kl_loss_coef * KL(pi || ref). Creates the ref model
+      use_kl_in_reward: false     # rewards - kl_loss_coef * KL instead (exclusive with use_kl_loss)
+      kl_loss_coef: 0.001
+      kl_estimator_type: k3       # k1, k2, k3, abs (joschu.net/blog/kl-approx.html)
+      use_entropy_loss: false
+      entropy_loss_coef: 0.01
+      lambd: 1.0                  # GAE only
+      gamma: 1.0                  # GAE only
+      value_clip: 0.2             # critic only
+      dynamic_sampling:
+        type: null                # null, filter (DAPO), replace (POLARIS)
+      off_policy_correction:
+        # trainer vs vLLM log-prob mismatch (docs.skyrl.ai/docs/algorithms/off_policy_correction).
+        # Masks apply multiplicatively: outlier sequence mask, token mask, sequence mask
+        tis_ratio_type: null
+        # null, token, sequence. token: weight each token's loss by min(pi_old/mu, C); neutralizes
+        # outliers (ratio 1e-4 -> weight ~0, ratio 1e4 -> C)
+        token_tis_ratio_clip_high: 2.0      # C for token (1.5-5)
+        sequence_tis_ratio_clip_high: 5.0   # C for sequence (2-10)
+        sequence_mask_metric: null
+        # null, product, geometric. geometric: zero a whole trajectory's loss when the geometric mean of
+        # its per-token ratios leaves [geo_mask_low, geo_mask_high]; beats TIS alone in SkyRL's comparison.
+        # Watch the masked fraction in policy/loss_metrics; widen to 0.98/1.02 if too much is masked
+        geo_mask_low: 0.99
+        geo_mask_high: 1.01
+        product_mask_low: 0.5
+        product_mask_high: 2.0
+        outlier_token_is_threshold_low: null    # mask sequences with any token ratio below (suggested 1e-4)
+        outlier_token_is_threshold_high: null   # ... above (suggested 100)
+        token_mask_is_threshold_low: null       # icepop: drop single tokens with a ratio outside [low, high]
+        token_mask_is_threshold_high: null      # instead of down-weighting them (e.g. 0.5 / 2.0)
+
+    # ---------------------------------------------------------------------------- batches
+    epochs: 1                     # passes over the dataset
+    max_training_steps: null      # stop after N steps regardless of epochs (smoke tests)
+    train_batch_size: 1024
+    # how many DISTINCT tasks for each inference step; generates train_batch_size * n_samples_per_prompt
+    # trajectories
+    policy_mini_batch_size: 256
+    # how many prompts (NOT trajectories) per optimizer.step(); a prompt = its n_samples_per_prompt
+    # trajectories. train_batch_size / policy_mini_batch_size = optimizer steps per batch (<= train_batch_size)
+    micro_train_batch_size_per_gpu: 1
+    # gradient accumulation per DP rank (not GPU): (policy_mini_batch_size * n_samples_per_prompt / DP)
+    # / micro_train_batch_size_per_gpu passes before optimizer.step()
+    micro_forward_batch_size_per_gpu: 1
+    # same for forward-only passes (old log-probs, ref, critic); no grads, so it can be larger.
+    # Order: forward only, then forward+backward with accumulation, then optimizer.step()
+    # BATCH RULE (checked at submit): policy_mini_batch_size * n_samples_per_prompt divisible by DP, and
+    # the per-rank result divisible by micro_train_batch_size_per_gpu
+    max_tokens_per_microbatch: -1
+    # IMPORTANT. > 0: micro batches are bin-packed by token count and both micro_* sizes are ignored.
+    # Soft cap: a single longer sequence gets a micro batch of its own. -1 = sample-count micro batches
+    update_epochs_per_batch: 1    # passes over the same train batch before the next one ("PPO epochs")
+    recompute_old_logprobs_per_minibatch: true
+    max_prompt_length: 512        # prompts longer than this are dropped at load time (PromptDataset)
+    critic_mini_batch_size: 256
+
+    # ---------------------------------------------------------------------------- eval
+    eval_batch_size: 1024
+    eval_before_train: true
+    eval_interval: 5              # every N steps; -1 = never
+    dump_eval_results: true       # to {export_path}/dumped_evals/
+
+    # ---------------------------------------------------------------------------- checkpoints / export
+    ckpt_path: ~/ckpts/
+    ckpt_interval: 10             # full FSDP checkpoint (model + optimizer, for resume) every N steps; -1 = never
+                                  # TildeOpen-30b: ~480 GB each
+    max_ckpts_to_keep: -1         # -1 = all
+    resume_mode: latest           # null: start fresh; latest: newest checkpoint in ckpt_path; from_path
+    resume_path: null             # for resume_mode=from_path
+    hf_save_interval: -1          # bf16 HF export to {export_path}/global_step_N every N steps; -1 = never
+    export_path: ~/exports/       # HF exports, dumps. ~ is quota-limited on LUMI: setups use paths.exports
+    update_ref_every_epoch: false # re-sync the ref from the policy at each epoch
+
+    # ---------------------------------------------------------------------------- logging
+    logger: wandb                 # console, wandb, mlflow, swanlab, tensorboard
+    project_name: skyrl
+    run_name: test_run
+    tags: null                    # wandb tags
+    log_path: /tmp/skyrl-logs     # infra logs (vLLM startup, model loading): {log_path}/infra-*.log
+    print_example_interval: 1     # print one prompt/response/reward every N steps; 0 = off
+    dump_data_batch: false        # pickle every training batch to {export_path}/dumped_data/ (debug)
+    enable_ray_gpu_monitor: true
+
+    # num_dummy_steps: 5          # full_context entrypoint only: number of max-length steps
+
+  generator:
+    # ---------------------------------------------------------------------------- vLLM engines
+    inference_engine:
+      backend: vllm
+      run_engines_locally: true
+      # SkyRL launches the engines; otherwise point it at running servers (external_server_urls,
+      # external_proxy_url)
+      num_engines: 1
+      # how many engines: inference GPUs / (tp * pp * dp). Setups: ${derived.num_engines}
+      tensor_parallel_size: 1
+      # GPUs one engine (model instance) is split over. Setups: ${layout.tp}
+      pipeline_parallel_size: 1
+      data_parallel_size: 1
+      expert_parallel_size: 1
+      distributed_executor_backend: ray
+      # mp (python multiprocessing) or ray. Most SkyRL examples and our setups use mp; ray MAY CAUSE ERRORS
+      served_model_name: null     # name in /chat/completions requests (Harbor). Setups: ${derived.served_name}
+      model_dtype: bfloat16       # weights are cast to this for the weight sync
+      gpu_memory_utilization: 0.8 # vLLM KV cache share (less for colocate_all=true)
+      max_num_seqs: 1024          # continuous batching: max sequences per engine step
+      max_num_batched_tokens: 8192  # continuous batching: max tokens per engine step
+      enable_prefix_caching: true
+      enforce_eager: false        # true: no CUDA/HIP graphs, slower, sometimes more stable
+      weight_sync_backend: nccl
+      # how new weights reach vLLM after each optimizer step: nccl (one communicator trainer rank 0 +
+      # all engine GCDs; see RCCL_MODEL_MATCHING_DISABLE in launch/lumi_env.sh) or delta (shared storage)
+      offload_kv_for_weight_sync: false  # free the KV cache during weight sync (allows higher gpu_memory_utilization)
+      engine_init_kwargs: {}
+      # passed to vLLM as-is, applied last. Setups: max_model_len (prompt + output <= max_model_len),
+      # chat_template (Harbor: a .jinja2 path; qwen3_acc_thinking keeps thinking tokens across steps)
+      router_init_kwargs: {}
+      # vllm-router args, e.g. policy: round_robin (each engine gets a trajectory at the start instead of
+      # a random assignment)
+
+    # ---------------------------------------------------------------------------- rollout
+    n_samples_per_prompt: 5
+    # trajectories per prompt (different through the temperature). GRPO computes each trajectory's
+    # advantage from its group: the model learns to prefer the best of its own answers
+    batched: false                # batched inference, single-turn only; agentic tasks need false
+    max_turns: 1                  # skyrl-gym multi-turn cap (Harbor: harbor_trial_config.agent.kwargs.max_turns)
+    max_input_length: null        # null = trainer.max_prompt_length
+    apply_overlong_filtering: false
+    # DAPO: loss-mask trajectories cut at max length (no EOS). pregen must keep false (it would zero the
+    # masks of every rollout that ended by length or tool-call limit)
+    zero_reward_on_non_stop: false
+    step_wise_trajectories: false
+    # each turn's (prompt, response) is its own training sample; the last step's advantage propagates to
+    # the earlier ones (docs.skyrl.ai/docs/tutorials/step-wise-training). Harbor: true
+    merge_stepwise_output: false  # prefix-aware merge of a trajectory's steps into one sequence. Harbor: true
+    chat_template:
+      source: name                # name (built-in) or file
+      name_or_path: null          # null = the tokenizer's template
+    sampling_params:
+      max_generate_length: 1024
+      # output cap PER LLM CALL (one agent turn), not per trajectory; vLLM cuts a sequence with no EOS here
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1                   # -1 = off
+      min_p: 0.0
+      # the trainer recomputes log-probs with a full softmax at `temperature`: top_p < 1, top_k > 0 or a
+      # different temperature on the vLLM side is a systematic train/infer mismatch
+      logprobs: 1
+      # 0 or 1 both return the sampled token's log-prob (needed for policy/*rollout*logprobs_abs_diff* and
+      # off-policy correction)
+      stop: null
+    eval_n_samples_per_prompt: 1
+    # eval_sampling_params: leave unset. Unset = greedy (temperature 0) at max_generate_length; setting any
+    # field replaces that whole default (temperature back to 1.0)
+
+    rate_limit:                   # Harbor entrypoint only
+      enabled: false
+      max_concurrency: null       # concurrent trials; <= Harbor workers (checked at submit)
+      trajectories_per_second: null   # trial start rate; null = unlimited
+
+  harbor_trial_config:
+    # Harbor entrypoint only. Harbor's TrialConfig, merged over SkyRL's
+    # /opt/SkyRL/examples/train_integrations/harbor/harbor_trial_config/default.yaml (values below are
+    # those defaults). SkyRL injects task.path, agent.model_name, agent.kwargs.api_base, session_id
+    trials_dir: ~/trials          # per-trial logs and outputs
+    timeout_multiplier: 1.0
+    agent:
+      name: terminus-2
+      override_timeout_sec: 1200  # per trial; timed-out trials are loss-masked
+      kwargs:
+        max_turns: 32             # safety cap; the context limit normally ends long trajectories first
+        enable_summarize: false   # context summarization near the token limit
+        collect_rollout_details: true   # per-turn token details, required for step-wise training
+        temperature: 1.0          # the only sampling param passed directly to Terminus
+        llm_kwargs:               # forwarded to litellm.acompletion(); setups add max_tokens and
+          timeout: 900            # extra_body.chat_template_kwargs.enable_thinking
+          max_retries: 0
+          top_p: 1.0
+          top_k: -1
+          min_p: 0.0
+        model_info:               # token budget inside the agent; setups: max_model_len - max_generate_length
+          max_input_tokens: 32768
+          max_output_tokens: 32768
+    environment:
+      type: daytona               # setups: apptainer (marin-harbor fork, trials run via the bridge)
+      override_cpus: 1
+      override_memory_mb: 1024
+      override_storage_mb: 1024
+    verifier:
+      disable: false              # true skips the reward tests (debugging)
