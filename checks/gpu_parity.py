@@ -7,7 +7,7 @@ tokens of the same model directory?  Run through checks/gpu_parity.sbatch (one n
     python -m checks.gpu_parity hf      --model DIR --out b.npz
     python -m checks.gpu_parity compare a.npz b.npz --model DIR --root REPO [--job ID]
 
-Both scorers read <model dir>/golden_tokenization.jsonl and store log p(token | previous tokens)
+Both scorers read the model's golden file (checks/golden/<model dir name>.jsonl) and store log p(token | previous tokens)
 for every token but the first of each prompt, as token ids in, no tokenizer involved, temperature 1.
 `compare` prints the difference and writes the verdict to <root>/.check_cache/, where
 `./check.sh pre` picks it up (settings.gpu_parity_record). The record is tied to the content of the
@@ -36,9 +36,9 @@ MAX_MEAN_SIGNED_DIFF = 0.01   # a systematic offset is the signature of two diff
 
 
 def golden_ids(model_dir, max_len):
-    from checks.tokenizer import GOLDEN, read_golden
+    from checks.tokenizer import golden_path, read_golden
 
-    rows = [g["ids"] for g in read_golden(os.path.join(model_dir, GOLDEN)) if 2 <= len(g["ids"]) <= max_len]
+    rows = [g["ids"] for g in read_golden(golden_path(model_dir)) if 2 <= len(g["ids"]) <= max_len]
     print("{} prompts, {} tokens".format(len(rows), sum(len(r) for r in rows)), flush=True)
     return rows
 

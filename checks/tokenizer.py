@@ -2,9 +2,11 @@
 Does the tokenizer the trainer and vLLM load from the model directory produce the token ids the
 model was trained with?
 
-Ground truth is <model dir>/golden_tokenization.jsonl: one {"messages": [...], "ids": [...]} per
-line, the chat-templated prompt (with generation prompt) as the model must see it. Build it once per
-model with checks/make_golden.py from data whose token ids are trusted.
+Ground truth is a golden file: one {"messages": [...], "ids": [...]} per line, the chat-templated
+prompt (with generation prompt) as the model must see it. It depends on the tokenizer, not on the
+weights, so there is one per model family in the repo: checks/golden/<model dir name>.jsonl.
+A <model dir>/golden_tokenization.jsonl, if present, is used instead. Build one with
+checks/make_golden.py from data whose token ids are trusted (checks/golden/README.md).
 
 Background: in this container transformers 5.8 loaded TildeOpen's tokenizer.model without the
 leading "▁" after control tokens (add_prefix_space=false): 0 of 300 prompts were tokenized the way
@@ -16,7 +18,16 @@ import os
 
 from checks.lib import FAIL, PASS, WARN, Result, check, small_model_files
 
-GOLDEN = "golden_tokenization.jsonl"
+GOLDEN = "golden_tokenization.jsonl"                                             # inside a model dir: override
+GOLDEN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden")  # in the repo: <model dir name>.jsonl
+
+
+def golden_path(model_dir):
+    """The golden file for a model dir: its own override if it has one, else the repo's file for its name."""
+    own = os.path.join(model_dir, GOLDEN)
+    if os.path.exists(own):
+        return own
+    return os.path.join(GOLDEN_DIR, os.path.basename(os.path.realpath(model_dir).rstrip("/")) + ".jsonl")
 
 
 def read_golden(path):
@@ -45,11 +56,12 @@ def compare(tokenizer_dir, golden):
     return same, where, example
 
 
-def golden_result(tokenizer_dir, golden_path, what):
-    if not os.path.exists(golden_path):
-        return Result(WARN, "no {} in the model dir: tokenization is unchecked".format(os.path.basename(golden_path)),
-                      ["build it once from trusted token ids: python -m checks.make_golden --data <rollouts.jsonl|parquet> --out {}".format(golden_path)])
-    golden = read_golden(golden_path)
+def golden_result(tokenizer_dir, golden_file, what):
+    if not os.path.exists(golden_file):
+        return Result(WARN, "no golden file for this model (checks/golden/{}): tokenization is unchecked".format(os.path.basename(golden_file)),
+                      ["a model dir is matched to its golden file by its directory name",
+                       "build one from trusted token ids: python -m checks.make_golden --data <rollouts.jsonl|parquet> --out {}".format(golden_file)])
+    golden = read_golden(golden_file)
     same, where, example = compare(tokenizer_dir, golden)
     data = {"identical": same, "total": len(golden)}
     if same == len(golden):
@@ -59,7 +71,7 @@ def golden_result(tokenizer_dir, golden_path, what):
                    "the model is prompted with token sequences it was not trained on"], data)
 
 
-@check("pre", "tokenizer.golden", cache_inputs=lambda ctx: small_model_files(ctx.model_dir))
+@check("pre", "tokenizer.golden", cache_inputs=lambda ctx: small_model_files(ctx.model_dir) + [golden_path(ctx.model_dir)])
 def tokenizer_golden(ctx):
-    """The model dir's tokenizer + chat template must reproduce the trusted token ids in golden_tokenization.jsonl."""
-    return golden_result(ctx.model_dir, os.path.join(ctx.model_dir, GOLDEN), "the model dir's tokenizer")
+    """The model dir's tokenizer + chat template must reproduce the trusted token ids of the model's golden file."""
+    return golden_result(ctx.model_dir, golden_path(ctx.model_dir), "the model dir's tokenizer")

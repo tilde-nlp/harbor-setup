@@ -1,9 +1,10 @@
 #!/usr/bin/env python
 """
-Build <model dir>/golden_tokenization.jsonl, the ground truth of the tokenizer check, from data
-whose token ids are trusted (ids produced by the pipeline that trained / sampled the model).
+Build a golden file, the ground truth of the tokenizer check, from data whose token ids are trusted
+(ids produced by the pipeline that trained / sampled the model). One per model family, kept in the
+repo; record where its prompts come from and their license in checks/golden/README.md.
 
-    python -m checks.make_golden --data <rollouts.jsonl | pregen.parquet> --out <model dir>/golden_tokenization.jsonl [--n 300]
+    python -m checks.make_golden --data <rollouts.jsonl | pregen.parquet> --out checks/golden/<model dir name>.jsonl [--n 300]
 
 Input: the tokenized rollout JSONL (keys uuid, prompt, prompt_token_ids) or the pregenerated parquet
 (prompt as a JSON string, prompt_ids, rep). One line per distinct prompt is written; prompts with

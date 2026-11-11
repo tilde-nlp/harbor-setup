@@ -1,7 +1,7 @@
 """
 Negative controls: every bug this suite was written for must still be caught, and the repaired
-state must pass. Needs the container (transformers + vLLM), the TildeOpen model dir with its
-golden_tokenization.jsonl, and for the last test one of the old exports. LUMI only:
+state must pass. Needs the container (transformers + vLLM), a TildeOpen model dir (its golden file is
+checks/golden/tildeopen.jsonl), and for the last test one of the old exports. LUMI only:
 
     ./check.sh selftest                # everything, ~4 min
     ./check.sh selftest -k "not export"   # without the slow export test
@@ -19,8 +19,8 @@ from checks.tests.conftest import BAD_EXPORT, EXPORT_BASE, MODEL_DIR
 
 pytest.importorskip("vllm")
 pytest.importorskip("transformers")
-needs_model = pytest.mark.skipif(not os.path.exists(os.path.join(MODEL_DIR, tokenizer.GOLDEN)),
-                                 reason="no model dir with a golden file at {}".format(MODEL_DIR))
+needs_model = pytest.mark.skipif(not (os.path.isdir(MODEL_DIR) and os.path.exists(tokenizer.golden_path(MODEL_DIR))),
+                                 reason="no model dir at {} or no golden file for it".format(MODEL_DIR))
 
 
 def rope(c):
@@ -85,9 +85,19 @@ def test_tokenizer_fix_passes(make_variant):
 
 @needs_model
 def test_missing_golden_file_is_a_warning_not_a_pass(make_variant):
-    d = make_variant("no_golden", {})
-    os.remove(os.path.join(d, tokenizer.GOLDEN))
+    d = make_variant("no_golden", {}, dir_name="a_model_without_a_golden_file")
+    if os.path.exists(os.path.join(d, tokenizer.GOLDEN)):     # an override copied along from the real model dir
+        os.remove(os.path.join(d, tokenizer.GOLDEN))
     assert tokenizer.tokenizer_golden(ctx(d)).status == WARN
+
+
+@needs_model
+def test_golden_file_inside_the_model_dir_overrides_the_repo_one(make_variant):
+    d = make_variant("override", {"tokenizer_config.json": lambda t: t.update(add_prefix_space=True)})
+    with open(os.path.join(d, tokenizer.GOLDEN), "w") as f:
+        f.write('{"messages": [{"role": "user", "content": "hi"}], "ids": [1, 2, 3]}\n')
+    assert tokenizer.golden_path(d) == os.path.join(d, tokenizer.GOLDEN)
+    assert tokenizer.tokenizer_golden(ctx(d)).status == FAIL       # the (deliberately wrong) override is what gets used
 
 
 @pytest.mark.skipif(not os.path.isdir(os.path.join(BAD_EXPORT, "policy")), reason="old export not available")

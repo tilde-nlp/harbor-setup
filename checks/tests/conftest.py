@@ -38,6 +38,8 @@ def variant(src, dst, edits):
 
 @pytest.fixture
 def make_variant(tmp_path):
-    def _make(name, edits, src=MODEL_DIR):
-        return variant(src, tmp_path / name, edits)
+    def _make(name, edits, src=MODEL_DIR, dir_name=None):
+        # keep the model dir's name: the repo's golden file is found by it (checks/golden/<name>.jsonl)
+        (tmp_path / name).mkdir()
+        return variant(src, tmp_path / name / (dir_name or os.path.basename(src.rstrip("/"))), edits)
     return _make

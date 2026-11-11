@@ -135,7 +135,9 @@ def data_pregen(ctx):
         return Result(FAIL, "skyrl.data.train_data[0] does not exist: {}".format(path))
     cfg = json.load(open(os.path.join(ctx.model_dir, "config.json")))
     assistant_id = None
-    golden = os.path.join(ctx.model_dir, "golden_tokenization.jsonl")
+    from checks.tokenizer import golden_path
+
+    golden = golden_path(ctx.model_dir)
     if os.path.exists(golden):  # the generation-prompt token is whatever the golden prompts end with
         assistant_id = json.loads(open(golden).readline())["ids"][-1]
     errors, warnings, stats = validate_pregen(

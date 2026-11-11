@@ -24,7 +24,7 @@ something to read once and decide on.
 **pre**
 - `model.rope_parity`: transformers and vLLM build the same rotary tables from `config.json`.
 - `model.config_keys`: rope keys only one of the two libraries reads (`attention_factor`, `attn_factor`, `apply_yarn_scaling`, ...).
-- `tokenizer.golden`: tokenizer + chat template reproduce `<model dir>/golden_tokenization.jsonl`.
+- `tokenizer.golden`: tokenizer + chat template reproduce the model's golden file, `checks/golden/<model dir name>.jsonl`.
 - `data.pregen`: pregenerated parquet: group sizes, mask and response lengths, sequence ends, vocabulary, scores, advantage balance.
 - `settings.ref_temperature`: temperature other than 1.0 together with a reference worker.
 - `settings.export_dtype`: is the planned update (lr x steps) large enough to survive a bf16 cast.
@@ -46,8 +46,12 @@ Thresholds are constants at the top of each module, next to the measurement they
 
 ## Preparing a model directory (once per model)
 
-1. `python -m checks.make_golden --data <data with trusted token ids> --out <model dir>/golden_tokenization.jsonl`
-   (inside the container). Trusted = token ids produced by the pipeline that trained or sampled the model.
+1. Golden file. A model dir is matched by its directory name to `checks/golden/<name>.jsonl`, which is in
+   the repo and valid for every checkpoint of that model family (it depends on the tokenizer, not on
+   the weights): for `tildeopen/` there is nothing to do. For a new model family, inside the container:
+   `python -m checks.make_golden --data <data with trusted token ids> --out checks/golden/<name>.jsonl`
+   (trusted = ids produced by the pipeline that trained or sampled the model), and record source and
+   license in `checks/golden/README.md`.
 2. `./check.sh pre <run.yaml>` and fix what FAILs. For TildeOpen that was, in the model dir:
    - `config.json`: delete `"attention_factor": 1.0` from `rope_scaling` and the top-level `"apply_yarn_scaling"` line;
    - `tokenizer_config.json`: `"add_prefix_space": true`.
@@ -63,6 +67,7 @@ Changing any small file of the model dir invalidates cached PASSes and the gpu r
     checks/model.py tokenizer.py data.py settings.py runlog.py export.py     the checks
     checks/gpu_parity.py gpu_parity.sbatch                                   the GPU job
     checks/make_golden.py                                                    builds the tokenizer ground truth
+    checks/golden/<model dir name>.jsonl                                     tokenizer ground truth per model family
     checks/st.py          numpy reader for safetensors, bf16 arithmetic
     checks/tests/test_logic.py        synthetic inputs; runs anywhere with numpy + pyarrow + pytest
     checks/tests/test_known_bugs.py   the three original bugs against the real model dir (LUMI)

@@ -122,10 +122,10 @@ def export_rope(ctx):
 @check("export", "export.tokenizer")
 def export_tokenizer(ctx):
     """The tokenizer files SkyRL wrote into the export must tokenize like the start model's golden file."""
-    from checks.tokenizer import GOLDEN, golden_result
+    from checks.tokenizer import golden_path, golden_result
 
     fp32, bf16 = export_dirs(ctx.export_dir)
-    golden = os.path.join(ctx.base_dir, GOLDEN)
+    golden = golden_path(ctx.base_dir)
     results = [golden_result(d, golden, "{}'s tokenizer".format(os.path.basename(d))) for d in (fp32, bf16) if d]
     worst = max(results, key=lambda r: [PASS, SKIP, WARN, FAIL].index(r.status))
     if worst.status == FAIL:
