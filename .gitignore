@@ -11,6 +11,9 @@
 !/skyrl_extensions/
 !/setup/
 !/notes/
+!/checks/
+!/check.sh
+/checks/results/
 
 __pycache__/
 *.py[oc]

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
-# Turn this clone into a working root: put the container, model, HF cache and data next to the code,
+# Turn this clone into a working root: put the container, HF cache and data next to the code,
 # taken from an existing, working root. The configs use the clone as paths.root (${derived.repo_dir}).
+#
+# The model directory is NOT set up here: which checkpoint to train is a per-experiment decision.
+# Create <root>/tildeopen (model.path) by hand: symlink the weight shards of the checkpoint you want,
+# copy (not link) its json / tokenizer files, then prepare it as described in checks/README.md
+# ("Preparing a model directory") and run ./check.sh pre.
 #
 #   mkdir <dir> && cd <dir> && git clone <repo url> . && ./setup.sh [<from_root>]
 #   from_root defaults to the gsm8k/benchmark root below; for pregen use .../grpo-pregen-rl (its data/replay).
@@ -13,12 +18,11 @@ set -euo pipefail
 
 FROM_DEFAULT=/scratch/project_465003062/environment/containers/fsdp-skyrl-harbor
 
-# Large and read-only during training: hard-linked (no extra space; survives deletion of the source).
+# Large and not edited by hand: hard-linked (no extra space; survives deletion of the source).
 # A symlink is made instead if a hard link is impossible (another file system or project quota).
 LINK=(
   multitorch_sandbox.sif    # the container (paths.sandbox)
-  tildeopen                 # the model (model.path); add other model dirs here
-  hf                        # HF_HOME (paths.hf_home)
+  hf                        # HF_HOME (paths.hf_home): hub models and datasets, ~150 GB
 )
 # Small, and may be rewritten per experiment: real copies, so the source can never be modified through them.
 COPY=(
@@ -62,4 +66,7 @@ for item in "${MKDIR[@]}"; do
   echo "  mkdir     $item/"
 done
 
-echo "done. Submit from here: ./submit.sh configs/<task>/<setup>.yaml"
+[ -d "$NEW/tildeopen" ] || echo "note: no model directory yet. Create $NEW/tildeopen by hand (see the header of this file)"
+echo "done. Check, then submit from here:"
+echo "  ./check.sh pre configs/<task>/<setup>.yaml      (a new model dir also needs: ./check.sh gpu ...)"
+echo "  ./submit.sh configs/<task>/<setup>.yaml"
