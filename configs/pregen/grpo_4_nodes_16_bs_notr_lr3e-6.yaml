@@ -15,21 +15,27 @@
 #   Trust-region arm for comparison: skyrl.trainer.algorithm.eps_clip_low=0.2 skyrl.trainer.algorithm.eps_clip_high=0.2 paths.experiment=tr
 # Reference on the policy GPUs: SkyRL swaps the two models, they are never on the GPUs together (worker_dispatch.py,
 #   _ensure_on_gpu: policy weights go to host RAM for the ref forward and back; the Adam state stays on the GPU).
-#   Ran 1,296 steps on this layout with 5 prompts per step (grpo-pregen-rl job 23285995). Batch size does not change
-#   GPU memory: micro batches are packed to max_tokens_per_microbatch tokens.
+#   Ran colocated with checkpoints and HF exports in job 23682492 (30-110 s per step depending on the sequence
+#   lengths of the batch, checkpoint ~45 s, export ~80 s, export node peak 225 GB of 480 GB host RAM).
+#   What it took to get the export through on shared GPUs: notes/BUGS.md.
+#   Batch size does not change GPU memory: micro batches are packed to max_tokens_per_microbatch tokens.
 # Other node counts: 16 x 8 = 128 rollouts must divide by DP = 8 x nodes / sp, so 2, 4 or 8 nodes (not 6), and
 #   fsdp_size has to be set with it: layout.policy_nodes=2 skyrl.trainer.policy.fsdp_config.fsdp_size=16
 # What to watch per step (./check.sh run <run dir> --table 405): policy/policy_kl (k2 = half the mean squared
 #   log-ratio to the start checkpoint; the paper's M2 is about 2 x this, its budget 0.04 ~ policy_kl 0.02) and
 #   policy/grad_norm. Collapse in the paper = M2 / KL spike, then accuracy drops. policy/loss_metrics/clip_ratio stays 0
-#   (open band). Step 1 is the bf16 noise floor (policy == reference): read later values against it.
+#   (open band). Noise floor: steps 1-2 show exactly 0 (lr is 0 at step 1, and policy and reference run on the same
+#   GPUs with the same packing, so equal weights give bit-equal log-probs); from the first real update on, the
+#   bf16 floor is policy_kl ~0.0013 and mean |log-prob diff| ~0.024 (job 23682492). Read later values against that.
+#   In that 20-step test policy_kl stayed <= 0.003 up to step 16, then 0.0165 / 0.0038 / 0.011 at steps 17-19
+#   (full lr from step 11; higher on batches with high entropy): it approaches the paper's budget within ~20 steps.
 # Evaluation: 9 exports (every 45 steps) + the start checkpoint as step 0, all with the same harness.
 #   ./check.sh export <export dir> --base tildeopen before evaluating (notes/TRAINING_SANITY_CHECK.md 3).
 #
-#   smoke:   ./submit.sh configs/pregen/grpo_4_nodes_16_bs.yaml slurm.partition=dev-g slurm.time=01:00:00 \
+#   smoke:   ./submit.sh configs/pregen/grpo_4_nodes_16_bs_notr_lr3e-6.yaml slurm.partition=dev-g slurm.time=01:00:00 \
 #              skyrl.trainer.max_training_steps=3 skyrl.trainer.ckpt_interval=-1 skyrl.trainer.hf_save_interval=-1
-#            then ./check.sh run previous_runs/latest: step 1 run.step1_noise_floor ~0.01-0.02
-#   run:     ./submit.sh configs/pregen/grpo_4_nodes_16_bs.yaml      (after a time-out: + skyrl.trainer.resume_mode=latest)
+#            then ./check.sh run previous_runs/latest
+#   run:     ./submit.sh configs/pregen/grpo_4_nodes_16_bs_notr_lr3e-6.yaml      (after a time-out: + skyrl.trainer.resume_mode=latest)
 #   another lr: skyrl.trainer.policy.optimizer_config.lr=1.0e-6 paths.experiment=lr1e-6   (own ckpt and export dirs)
 #
 # Self-contained. Meaning of every key and SkyRL's defaults: configs/REFERENCE.yaml.
@@ -38,10 +44,10 @@
 slurm:
   account: project_465003062
   partition: standard-g
-  time: "12:00:00"                      # estimate ~8 h (bs5 on this layout: 22 s per 40 rollouts); resume_mode=latest after a time-out
+  time: "12:00:00"                      # 30-110 s per step (job 23682492): 4-8 h + exports; resume_mode=latest after a time-out
   job_name: skyrl-${derived.config_name}
   cpus_per_task: 56
-  extra: []
+  extra: ["--exclude=nid[005018-005021]"]   # runs hang in the first forward pass on these nodes (notes/BUGS.md)
 
 paths:
   root: ${derived.repo_dir}               # this clone, populated by setup.sh
@@ -124,7 +130,7 @@ skyrl:
     remove_microbatch_padding: true
     eval_before_train: false              # [SkyRL default: true]
     eval_interval: -1                     # [SkyRL default: 5]
-    ckpt_interval: 45                     # [SkyRL default: 10] ~480 GB each, one kept; one per export
+    ckpt_interval: 45                     # [SkyRL default: 10] ~343 GB each, one kept; one per export
     max_ckpts_to_keep: 1                  # [SkyRL default: -1]
     hf_save_interval: 45                  # [SkyRL default: -1] 9 HF exports: enough points to see a rise and a collapse
     resume_mode: null                     # [SkyRL default: latest]

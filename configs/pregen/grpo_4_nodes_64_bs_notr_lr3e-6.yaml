@@ -1,0 +1,150 @@
+# GRPO on pre-generated rollouts WITHOUT a trust region: 64 prompts per step, lr 3e-6, clip band open, no KL term.
+# Same as grpo_4_nodes_16_bs_notr_lr3e-6.yaml with 4 x the batch: 512 rollouts per update, the paper's batch size.
+# Stored, tokenized, scored rollouts are fed to the trainer instead of sampling (skyrl_extensions/pregenerated).
+# No vLLM, no weight sync. 6,488 prompts x 8 rollouts, 64 prompts per step -> 101 steps; 100 are run = 10 x 10 exports.
+# 4 policy nodes (32 GCDs, SP=4, DP=8, fsdp_size=32); the reference (frozen start checkpoint) shares the policy GPUs.
+#
+# Replicates the eps = infinity arm of "Prosperity before Collapse" (M2PO, arXiv 2510.01161): on stale data, GRPO
+#   without a trust region learns about as well as on-policy for a while, then collapses from the variance of the
+#   importance ratios. Shared with the paper: AdamW 0.9/0.999, wd 0.01, grad clip 1.0, 8 rollouts per prompt,
+#   advantage = (score - group mean) / group std, token-mean loss, no KL term, temperature 1.
+#   512 rollouts per update as in the paper. Different: lr 3e-6 (paper 1e-6), 100 updates (paper 4,000), rewards 0-10.
+#   A quarter of the updates of the 16-prompt run at the same lr: the policy moves less, a collapse is less likely to show.
+# The data is stale by construction: every rollout comes from the start checkpoint, so it is t updates old at update t
+#   (the paper regenerates data, 256 updates behind; the same as this for its first 256 updates).
+#   Nothing limits how far the policy moves from it: the loss gradient is ratio x advantage x grad log p for every
+#   token, ratio = pi_theta / pi_ref.
+#   Trust-region arm for comparison: skyrl.trainer.algorithm.eps_clip_low=0.2 skyrl.trainer.algorithm.eps_clip_high=0.2 paths.experiment=tr
+# Reference on the policy GPUs: SkyRL swaps the two models, they are never on the GPUs together (worker_dispatch.py,
+#   _ensure_on_gpu: policy weights go to host RAM for the ref forward and back; the Adam state stays on the GPU).
+#   Ran colocated with checkpoints and HF exports at 16 prompts per step in job 23682492 (30-110 s per step,
+#   checkpoint ~45 s, export ~80 s, export node peak 225 GB of 480 GB host RAM). 64 prompts per step is NOT run yet:
+#   expect about 4 x the step time; GPU memory is the same (next line).
+#   What it took to get the export through on shared GPUs: notes/BUGS.md.
+#   Batch size does not change GPU memory: micro batches are packed to max_tokens_per_microbatch tokens.
+# Other node counts: 64 x 8 = 512 rollouts must divide by DP = 8 x nodes / sp, so 2, 4 or 8 nodes (not 6), and
+#   fsdp_size has to be set with it: layout.policy_nodes=2 skyrl.trainer.policy.fsdp_config.fsdp_size=16
+# What to watch per step (./check.sh run <run dir> --table 100): policy/policy_kl (k2 = half the mean squared
+#   log-ratio to the start checkpoint; the paper's M2 is about 2 x this, its budget 0.04 ~ policy_kl 0.02) and
+#   policy/grad_norm. Collapse in the paper = M2 / KL spike, then accuracy drops. policy/loss_metrics/clip_ratio stays 0
+#   (open band). Noise floor: steps 1-2 show exactly 0 (lr is 0 at step 1, and policy and reference run on the same
+#   GPUs with the same packing, so equal weights give bit-equal log-probs); from the first real update on, the
+#   bf16 floor is policy_kl ~0.0013 and mean |log-prob diff| ~0.024 (job 23682492). Read later values against that.
+#   (At 16 prompts per step, job 23682492: policy_kl <= 0.003 up to step 16, then 0.0165 / 0.0038 / 0.011 at steps 17-19.)
+# Evaluation: 10 exports (every 10 steps) + the start checkpoint as step 0, all with the same harness.
+#   ./check.sh export <export dir> --base tildeopen before evaluating (notes/TRAINING_SANITY_CHECK.md 3).
+#
+#   smoke:   ./submit.sh configs/pregen/grpo_4_nodes_64_bs_notr_lr3e-6.yaml slurm.partition=dev-g slurm.time=01:00:00 \
+#              skyrl.trainer.max_training_steps=3 skyrl.trainer.ckpt_interval=-1 skyrl.trainer.hf_save_interval=-1
+#            then ./check.sh run previous_runs/latest
+#   run:     ./submit.sh configs/pregen/grpo_4_nodes_64_bs_notr_lr3e-6.yaml      (after a time-out: + skyrl.trainer.resume_mode=latest)
+#   another lr: skyrl.trainer.policy.optimizer_config.lr=1.0e-6 paths.experiment=lr1e-6   (own ckpt and export dirs)
+#
+# Self-contained. Meaning of every key and SkyRL's defaults: configs/REFERENCE.yaml.
+# SkyRL keys not listed keep the default; [SkyRL default: X] marks a value changed from it.
+
+slurm:
+  account: project_465003062
+  partition: standard-g
+  time: "12:00:00"                      # not measured at this batch size; 4 x the 16-prompt step would be 2-7 min per step. resume_mode=latest after a time-out
+  job_name: skyrl-${derived.config_name}
+  cpus_per_task: 56
+  extra: ["--exclude=nid[005018-005021]"]   # runs hang in the first forward pass on these nodes (notes/BUGS.md)
+
+paths:
+  root: ${derived.repo_dir}               # this clone, populated by setup.sh
+  sandbox: ${paths.root}/multitorch_sandbox.sif
+  binds: [/var/spool/slurmd, /scratch/project_465003062, /scratch/project_465002038]
+  hf_home: ${paths.root}/hf
+  data: ${paths.root}/data
+  logs: ${paths.root}/logs
+  ckpts: ${paths.root}/ckpts
+  exports: ${paths.root}/exports
+  runs: ${paths.root}/previous_runs
+  experiment: ${derived.config_name}      # names ckpts/ and exports/. One per arm (paths.experiment=retuned), or
+                                          # arms overwrite each other's exports and resume from each other's ckpts
+
+model:
+  path: ${paths.root}/tildeopen           # must be the checkpoint that generated the rollouts
+  max_model_len_cap: 65536
+
+layout:
+  gpus_per_node: 8
+  policy_nodes: 4                         # 32 GCDs, DP = 32 / sp = 8
+  inference_nodes: 0                      # nothing is generated
+  ref_nodes: 0                            # 0: ref on the policy GPUs; > 0: own nodes (placement follows)
+  sp: 4
+  ray_port: 6379
+
+entrypoint:
+  module: skyrl_extensions.pregenerated.entrypoint
+  cwd: null
+
+env:
+  NCCL_DEBUG: WARN
+
+skyrl:
+  data:
+    train_data: ["${paths.data}/replay/replay.parquet"]   # prompts and stored rollouts; no val_data
+
+  trainer:
+    strategy: fsdp
+    logprobs_chunk_size: 512              # [SkyRL default: 1024]
+    placement:
+      colocate_all: false                 # [SkyRL default: true]
+      colocate_policy_ref: ${derived.ref_colocated}   # = true here (layout.ref_nodes == 0): ref shares the policy GPUs
+      policy_num_nodes: ${layout.policy_nodes}
+      policy_num_gpus_per_node: ${layout.gpus_per_node}
+      ref_num_nodes: ${derived.ref_placement_nodes}
+      ref_num_gpus_per_node: ${layout.gpus_per_node}
+    policy:
+      model:
+        path: ${derived.model}
+      sequence_parallel_size: ${layout.sp}
+      fsdp_config:
+        fsdp_size: 32                     # [SkyRL default: -1] = policy_nodes x gpus_per_node: one copy sharded over all 32 GCDs
+      optimizer_config:
+        lr: 3.0e-6                        # [SkyRL default: 1.0e-6]
+        adam_betas: [0.9, 0.999]
+        num_warmup_steps: 3               # [SkyRL default: 0] same share of the run as 10 of 405
+        offload_after_step: false         # [SkyRL default: true] keep optimizer state on GPU
+    ref:
+      sequence_parallel_size: ${layout.sp}
+    algorithm:
+      advantage_estimator: grpo
+      grpo_norm_by_std: true              # (score - group mean) / group std, as in the paper
+      loss_reduction: token_mean
+      policy_loss_type: rollout_is        # [SkyRL default: regular] ratio vs the ref worker's log-probs
+      eps_clip_low: 1.0                   # [SkyRL default: 0.2] band (1 - low, 1 + high) = (0, 1e9): no token is dropped.
+      eps_clip_high: 1.0e+9               # [SkyRL default: 0.2] the ratio is clamped to e^20 = 4.9e8 < 1e9. Gradient = ratio x advantage x grad log p
+      use_kl_loss: true                   # creates the ref worker; rollout_is needs it
+      kl_loss_coef: 0.0                   # [SkyRL default: 0.001] no KL term (paper); a KL to the ref would be a trust region
+      kl_estimator_type: k2               # [SkyRL default: k3] logging only: policy_kl = 0.5 x mean (log ratio)^2
+      max_seq_len: 65536                  # [SkyRL default: null] >= longest stored prompt + response
+
+    epochs: 1
+    max_training_steps: 100               # [SkyRL default: null] 6,488 / 64 = 101.4 -> 100 = 10 x 10
+    train_batch_size: 64                  # [SkyRL default: 1024] prompts per step (x 8 rollouts); x 8 must divide by DP
+    policy_mini_batch_size: 64            # [SkyRL default: 256] one update per batch
+    micro_train_batch_size_per_gpu: 1
+    micro_forward_batch_size_per_gpu: 1
+    max_tokens_per_microbatch: ${skyrl.trainer.algorithm.max_seq_len}
+    remove_microbatch_padding: true
+    eval_before_train: false              # [SkyRL default: true]
+    eval_interval: -1                     # [SkyRL default: 5]
+    ckpt_interval: 10                     # [SkyRL default: 10] ~343 GB each, one kept; one per export
+    max_ckpts_to_keep: 1                  # [SkyRL default: -1]
+    hf_save_interval: 10                  # [SkyRL default: -1] 10 HF exports (fp32, ~115 GB each)
+    resume_mode: null                     # [SkyRL default: latest]
+    ckpt_path: ${paths.ckpts}/${skyrl.trainer.project_name}_${derived.served_name}_${paths.experiment}
+    export_path: ${paths.exports}/${skyrl.trainer.project_name}_${paths.experiment}
+    log_path: ${paths.logs}
+    logger: console                       # [SkyRL default: wandb]
+    project_name: pregen_bs${skyrl.trainer.train_batch_size}
+    run_name: ${skyrl.trainer.project_name}_${derived.run_id}
+
+  generator:
+    n_samples_per_prompt: 8               # [SkyRL default: 5] = group size in the parquet (asserted)
+    apply_overlong_filtering: false       # must stay false (REFERENCE.yaml)
+    sampling_params:
+      temperature: 1.0                    # same as at generation

@@ -50,3 +50,60 @@ Idfk, but this happens when I use colocate_all=false IN SOME CASES, but in some 
 export RCCL_MODEL_MATCHING_DISABLE=1
 ```
 
+
+## Run hangs in the first forward pass on nid[005018-005021]
+
+This is on 12.11.26, dev-g.
+
+### What happens
+
+The job reaches step 1, logs `Started: 'fwd_logprobs_values_reward'` and never logs anything again. No error, no
+OOM, host RAM flat on every node. Stacks (`fsdp-skyrl-harbor/inspect_hung_job.sh <jobid>`): all 32 reference
+workers sit in the first attention layer, in `bool()` of a GPU tensor (`modeling_flash_attention_utils.py:773`),
+i.e. in a GPU sync that waits for queued GPU work (the collectives before it) that never finishes. The policy
+workers are idle, the driver waits for the reference.
+
+### Evidence that it is the nodes
+
+| jobs | nodes | first forward pass |
+|---|---|---|
+| 23677895, 23681198 | nid[005018-005021] | hung, both |
+| 23674901, 23675865, 23676681, 23677124 | nid[005002-005014] | ~40 s |
+| 23678761 (same code as the hang before it), 23682492 | nid[007961-007964] | ~40 s |
+
+Two hangs, both on this node set, eight passes on other nodes, with the same code on both sides. Which of the
+four nodes (or which GPU / link) is at fault is not known: the stacks are the same on all four. One bad
+GPU or link stalls everyone, because the model is sharded over all 32 GCDs and every forward pass runs collectives
+across all nodes. Not reported to LUMI support yet.
+
+### What to do
+
+- The pregen configs exclude the nodes: `slurm.extra: ["--exclude=nid[005018-005021]"]`.
+- `launch/job.sbatch` has a watchdog: once training has started, 15 min without a new line in the Slurm log
+  cancels the job and writes `<run dir>/HUNG` with the node list and the exclude override (`HANG_TIMEOUT_MIN`).
+  Then resubmit with `skyrl.trainer.resume_mode=latest`. A hang before the first step is not covered.
+- If it happens on other nodes: rerun once with `env.NCCL_DEBUG=INFO` (logs every collective) and add the nodes here.
+
+
+## Host OOM in the HF export when the reference shares the policy GPUs
+
+Jobs 23674901, 23675865 (and grpo-pregen-rl 23282545): `oom_kill` on the rank-0 node in `save_hf_model` with
+~290 GB of the node free.
+
+### Explanation
+
+SkyRL's `Worker.offload_to_cpu()` calls `_set_numa_affinity()`: `numa_set_membind` on the NUMA node of the worker's
+GPU. That binding is strict, and a LUMI-G node has 4 NUMA nodes of 126 GB. Workers only offload when policy and
+reference are colocated (they swap between GPU and host RAM), so only then is the binding set. For the export rank 0
+gathers the whole fp32 model (120 GB) in its own process: it does not fit in one NUMA node next to three other
+workers, and the kernel kills it instead of using the other NUMA nodes. `previous_runs/<run>/mem/<node>.log`
+(host RAM every 5 s) is what showed that the node was not full.
+
+### Fix
+
+`skyrl_extensions/pregenerated/entrypoint.py`, `SpillPolicyWorkerBase`: same CPU binding, memory policy back to
+"local node first, spill when full". Export node peak afterwards: 225 GB of 480 GB (job 23682492).
+Two more things found on the way: the staged model copy in /tmp costs 58 GB of RAM per node and is deleted once
+the models are loaded (`free_staged_weights`); and the export failed in `import deepspeed` on a host module path
+(`CMAKE_PREFIX_PATH`) that is unreadable in the container (`launch/lumi_env.sh`).
+

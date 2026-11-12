@@ -27,6 +27,14 @@ export HIP_VISIBLE_DEVICES="${ROCR_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 unset ROCR_VISIBLE_DEVICES CUDA_VISIBLE_DEVICES
 export HWLOC_COMPONENTS=-amd_smi,-rsmi
 
+# --- host module paths that leak into the container ---
+# The HF export (save_pretrained -> accelerate -> `import deepspeed`) makes deepspeed look for CUTLASS headers
+# in CMAKE_PREFIX_PATH. The login shell's lumi-tools module sets it to /appl/lumi/..., which exists in the
+# container as an unreadable directory: PermissionError instead of "not found", and the export dies after
+# the 120 GB gather (job 23676681). Only on GPU nodes: without a GPU deepspeed returns before the lookup.
+unset CMAKE_PREFIX_PATH
+export CUTLASS_PATH=DS_IGNORE_CUTLASS_DETECTION   # deepspeed's own switch: skip the lookup
+
 # --- node-local caches (/tmp is RAM, per node, charged to the job's memory cgroup) ---
 export MIOPEN_USER_DB_PATH="/tmp/$USER-miopen-${SLURM_JOB_ID:-x}"
 export MIOPEN_CUSTOM_CACHE_DIR="$MIOPEN_USER_DB_PATH"

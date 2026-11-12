@@ -15,20 +15,35 @@ What is custom here:
     NoInferenceClient + PregeneratedTrainer.init_weight_sync_state
                                       no vLLM engines are started and no weights are pushed: the
                                       inference node and the per-step broadcast are gone
+    SpillPolicyWorker                 SkyRL binds a worker's memory strictly to its GPU's NUMA node (126 GB) the
+                                      first time it offloads, i.e. only when the reference shares the policy
+                                      GPUs. Rank 0 then cannot gather the 120 GB state dict for the HF export
+                                      (host OOM with 290 GB free). Keeps the CPU binding, lets memory spill over.
+                                      Its HF export is export.py: shards written in parallel, tokenizer files
+                                      copied from the start model
+    free_staged_weights               once policy and reference are loaded, the weight files of the staged
+                                      model copy in /tmp (node RAM, ~60 GB per node) are deleted
 
 Run (inside the container, under ray):
     python -m skyrl_extensions.pregenerated.entrypoint data.train_data="['/path/pregenerated.parquet']" <skyrl overrides>
 """
+import glob
+import os
 import sys
+from ctypes import CDLL
+from ctypes.util import find_library
 
 import ray
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
+from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import FSDPPolicyWorkerBase
 from skyrl.train.config import SkyRLTrainConfig
 from skyrl.train.entrypoints.main_base import BasePPOExp
 from skyrl.train.trainer import RayPPOTrainer
 from skyrl.train.utils import validate_cfg
 from skyrl.train.utils.utils import initialize_ray
 
+from skyrl_extensions.pregenerated import export
 from skyrl_extensions.pregenerated.generator import PregeneratedDataset, PregeneratedGenerator, PregeneratedStore
 
 class NoInferenceClient:
@@ -49,7 +64,65 @@ class NoInferenceClient:
         return _noop
 
 
+class SpillPolicyWorkerBase(FSDPPolicyWorkerBase):
+    """
+    worker.py offload_to_cpu() -> _set_numa_affinity(): numa_run_on_node_mask + numa_set_membind on the NUMA node
+    of the worker's GPU. membind is strict: when that node (126 GB on LUMI-G, shared by 2 policy and 2 reference
+    workers) is full the kernel OOM-kills instead of using the other three nodes. Training never needs that much
+    per worker, the HF export does: rank 0 gathers the whole fp32 model (120 GB) in host RAM. Jobs 23674901 and
+    23675865 died there with ~290 GB of the node free (previous_runs/<run>/mem/). Without colocation nothing is
+    ever offloaded, so the binding is never set and the export works.
+    Here: same CPU binding, then back to the default policy (allocate on the local node, spill when it is full).
+    """
+
+    def _set_numa_affinity(self, rank):
+        super()._set_numa_affinity(rank)
+        try:
+            CDLL(find_library("numa")).numa_set_localalloc()
+        except Exception as e:  # no libnuma: the parent did not bind either
+            print("SpillPolicyWorker: numa_set_localalloc not applied: {}".format(e), flush=True)
+
+    def save_hf_model(self, export_dir, tokenizer):
+        # parallel shard writer + the start model's tokenizer files: skyrl_extensions/pregenerated/export.py
+        export.save_hf_model(self, export_dir, tokenizer)
+
+
+SpillPolicyWorker = ray.remote(num_gpus=1)(SpillPolicyWorkerBase)
+
+
+@ray.remote(num_cpus=0)
+def _remove_weight_files(model_dir):
+    freed = 0
+    for path in glob.glob(os.path.join(model_dir, "*.safetensors")) + glob.glob(os.path.join(model_dir, "*.bin")):
+        freed += os.path.getsize(path)
+        os.remove(path)
+    return freed
+
+
+def free_staged_weights(model_dir):
+    """
+    launch/job.sbatch copies the model to /tmp on every node. /tmp is RAM charged to the job, and after
+    the workers have loaded policy and reference nothing reads the weight files again (no vLLM here; the HF
+    export writes config and tokenizer from memory, a resume reads ckpts/). With the reference on the policy
+    GPUs the HF export ran out of host RAM on the rank-0 node (job 23674901): this gives 60 GB back per node.
+    The small files (config, tokenizer) stay. Only touches a copy under /tmp.
+    """
+    if not os.path.realpath(model_dir).startswith("/tmp/"):
+        return
+    nodes = [n["NodeID"] for n in ray.nodes() if n["Alive"]]
+    freed = ray.get([
+        _remove_weight_files.options(scheduling_strategy=NodeAffinitySchedulingStrategy(n, soft=False)).remote(model_dir)
+        for n in nodes
+    ])
+    print("free_staged_weights: removed {:.0f} GB of weight files from {} on {} nodes".format(sum(freed) / 2**30, model_dir, len(nodes)), flush=True)
+
+
 class PregeneratedTrainer(RayPPOTrainer):
+    def build_models(self, PolicyWorker, CriticWorker, RefWorker):
+        if self.cfg.trainer.strategy == "fsdp":
+            PolicyWorker = SpillPolicyWorker
+        return super().build_models(PolicyWorker, CriticWorker, RefWorker)
+
     def init_weight_sync_state(self):
         # trainer.py 855: would build the NCCL group between policy workers and engines. Instead,
         # disable the two pushes that follow it (initial sync at 289, per-step sync at 494), which
@@ -57,6 +130,8 @@ class PregeneratedTrainer(RayPPOTrainer):
         async def _no_sync(model_id=None):
             return None
         self.dispatch.save_weights_for_sampler = _no_sync
+        # Called from the trainer right after build_models: policy and reference are loaded on every worker.
+        free_staged_weights(self.cfg.trainer.policy.model.path)
 
     def train_critic_and_policy(self, data):
         base = data.get("base_action_log_probs", None)

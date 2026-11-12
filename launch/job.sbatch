@@ -44,8 +44,34 @@ apply_env() {
 die() { echo "FATAL: $*" >&2; exit 1; }
 
 # --- role: batch. Runs under sbatch on the first node of the allocation. ---
+# Hang watchdog (batch node, background). A stuck collective never returns and never errors: the job would sit
+# silent until the time limit with every node billed (jobs 23677895 and 23681198 on nid[005018-005021], hung in
+# the first forward pass; the worker timeout is 1 h because rank 0 needs minutes to load the model).
+# Once training has started, the Slurm log gets a line at least every step; the longest quiet phases are a
+# long step, a checkpoint and the HF export (each well under 10 min for TildeOpen-30B). No new line for
+# HANG_TIMEOUT_MIN -> record the nodes in $RUN_DIR/HUNG, print how to resubmit, cancel the job.
+# watchdog <log> <limit seconds> <poll seconds>
+watchdog() {
+  local log=$1 limit=$2 poll=$3 age
+  until grep -q "Started: 'step'" "$log" 2>/dev/null; do sleep "$poll"; done
+  while sleep "$poll"; do
+    age=$(( $(date +%s) - $(stat -c %Y "$log") ))
+    (( age > limit )) || continue
+    {
+      echo "WATCHDOG: no output for $(( age / 60 )) min after training started: the job hangs. Cancelling it."
+      echo "  nodes: ${SLURM_JOB_NODELIST:-?}"
+      echo "  stacks of a hung job (before cancelling by hand): fsdp-skyrl-harbor/inspect_hung_job.sh <jobid>"
+      echo "  resubmit without these nodes: add  'slurm.extra=[\"--exclude=${SLURM_JOB_NODELIST:-}\"]'"
+      echo "  and, if a checkpoint exists, skyrl.trainer.resume_mode=latest"
+    } | tee "$(dirname "$log")/HUNG"
+    scancel "${SLURM_JOB_ID:?}"
+    return
+  done
+}
+
 role_batch() {
   scontrol show job "$SLURM_JOB_ID" > "$RUN_DIR/slurm_job.txt"
+  watchdog "$RUN_DIR/slurm-$SLURM_JOB_ID.out" $(( ${HANG_TIMEOUT_MIN:-15} * 60 )) 60 &
   echo "run dir: $RUN_DIR"
   echo "$LAYOUT_SUMMARY"
 
@@ -114,6 +140,15 @@ role_node() {
   echo "[$SLURMD_NODENAME] staging $MODEL_SRC -> $MODEL, timing on the next line:"
   TIMEFORMAT="[$SLURMD_NODENAME] staging took %R s"
   time (ls "$MODEL_SRC" | xargs -P 16 -I{} cp -rL "$MODEL_SRC/{}" "$MODEL/")
+
+  # Host RAM of this node every 5 s -> $RUN_DIR/mem/<node>.log (GB). The node is exclusive, so /proc/meminfo is
+  # the job: used = total - available, anon = process memory, shmem = /tmp + /dev/shm (staged model, ray object
+  # store), file = page cache incl. dirty Lustre pages. Answers "what filled the node" after a host OOM.
+  mkdir -p "$RUN_DIR/mem"
+  ( while sleep 5; do
+      awk -v t="$(date +%T)" '{v[$1]=$2/1048576} END{printf "%s used %.0f anon %.0f shmem %.0f file %.0f dirty %.1f\n", t,
+        v["MemTotal:"]-v["MemAvailable:"], v["AnonPages:"], v["Shmem:"], v["Cached:"]-v["Shmem:"], v["Dirty:"]+v["Writeback:"]}' /proc/meminfo
+    done >> "$RUN_DIR/mem/$SLURMD_NODENAME.log" 2>/dev/null ) &
 
   exec singularity exec -B "$BINDS" "$SANDBOX" bash "$SELF" "$RUN_DIR" inner
 }
