@@ -20,7 +20,7 @@ slurm:
   job_name: skyrl-${derived.config_name}
   cpus_per_task: 56
   extra: []                       # any other sbatch flags, e.g. ["--reservation=foo"]
-  # nodes is never set: it is layout.policy_nodes + inference_nodes + ref_nodes
+  # nodes is never set: it is layout.policy_nodes + inference_nodes + ref_nodes (+ judge.nodes)
 
 paths:
   root: ${derived.repo_dir}
@@ -80,12 +80,50 @@ entrypoint:
   #   examples.train_scripts.full_context.main_full_ctx            (benchmark; adds trainer.num_dummy_steps)
   #   examples.train_integrations.harbor.entrypoints.main_harbor   (adds harbor_trial_config, generator.rate_limit)
   #   skyrl_extensions.pregenerated.entrypoint                     (ours, skyrl_extensions/)
+  #   skyrl_extensions.judge.entrypoint                            (ours; main_base + the "judge" env, needs judge:)
   cwd: null                       # /opt/SkyRL for modules under examples.*
 
 env: {}
 # extra variables on every node, applied after launch/lumi_env.sh (which explains every variable), e.g.
 #   NCCL_NET: Socket      transport; default Libfabric
 #   NCCL_DEBUG: WARN      default INFO with COLL: logs every collective, chatty
+
+judge:                            # judge configs only (entrypoint skyrl_extensions.judge.entrypoint)
+  # On-policy single-step RL with the reward from a judge model: rows with env_class "judge" are graded by
+  # an LLM behind an OpenAI API instead of a rule. How it works and what is logged: skyrl_extensions/judge/env.py
+  name: gsm8k
+  # which judge: prompt, answer schema (enforced by vLLM as JSON schema) and reward, in
+  # skyrl_extensions/judge/judges.py. gsm8k (0/1, also logs the rule-based reward), science (0..10, the
+  # judge of the offline rollouts)
+  nodes: 1
+  # judge nodes: added to the Slurm allocation after the layout nodes, outside Ray. Each runs
+  # gpus_per_node / tp independent `vllm serve` processes (launch/job.sbatch role judge); requests go
+  # round-robin over all of them. The driver waits for them before it loads the policy
+  base_url: null
+  # with nodes: 0, a server that already runs (comma-separated .../v1 URLs). Compute nodes are offline:
+  # this means another job on LUMI, not an external API
+  model:
+    path: Qwen/Qwen3-30B-A3B-Thinking-2507
+    # dir, or hub id downloaded to hf_home; staged to /tmp on the judge nodes. Its basename is the served
+    # name. Must be instruction-tuned (a base model cannot follow the rubric)
+  tp: 2                           # tensor parallel per judge server; must divide gpus_per_node
+  port: 8100                      # first server; the others count up
+  vllm_args: "--reasoning-parser qwen3 --max-model-len 32768 --gpu-memory-utilization 0.9"
+  # extra `vllm serve` flags, one string. A thinking model needs its reasoning parser: the JSON schema then
+  # applies to the verdict, after the thinking. max-model-len must hold the judge prompt (instructions +
+  # reference + max_chars of completion) plus max_tokens
+  temperature: 0.6                # 0.0 for a non-thinking judge; Qwen3 thinking models can loop when greedy
+  extra_body: {top_p: 0.95, top_k: 20}
+  # extra request fields, as-is. A Qwen3 model with switchable thinking, without it:
+  #   extra_body: {chat_template_kwargs: {enable_thinking: false}}
+  max_tokens: 4096
+  # of the judge's reply, thinking included. Too low: no verdict, reward 0, environment/judge_unparsed > 0
+  max_chars: 20000                # completions longer than this are cut (head 2/3 + tail 1/3) in the judge prompt
+  timeout_s: 600                  # per request; then retried (4x, backoff), then the run fails
+  startup_timeout_s: 1800         # staging + vLLM start of the judge servers
+  # Also set: skyrl.environment.env_class: judge, skyrl.generator.batched: false (render.py checks),
+  # skyrl.environment.skyrl_gym.max_env_workers = judge requests in flight, and for long prompts
+  # skyrl.trainer.max_prompt_length (default 512: longer prompts are dropped at load time)
 
 harbor_env:                       # Harbor configs only: the environment-plane job (launch/harbor_env.sbatch)
   submit: true                    # false: reuse another run's env job; point bridge_file at its run dir
@@ -113,6 +151,8 @@ skyrl:
 
   environment:
     env_class: gsm8k              # skyrl-gym env computing the reward (each parquet row also names its env)
+    skyrl_gym:
+      max_env_workers: 32         # thread pool for env.init/step/close; judge configs: judge requests in flight
 
   trainer:
     # ---------------------------------------------------------------------------- backend

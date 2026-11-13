@@ -16,7 +16,7 @@ Writes into <paths.runs>/<timestamp>-<config name>/:
     skyrl_args             one SkyRL override per line (key=value), passed to the entrypoint as-is
     job.env                variables for launch/job.sbatch and launch/harbor_env.sbatch
     env.sh                 the config's `env:` section, applied after launch/lumi_env.sh
-    sbatch_args            sbatch flags of the training job (nodes = sum of layout nodes)
+    sbatch_args            sbatch flags of the training job (nodes = sum of layout nodes + judge.nodes)
     harbor_env.sbatch_args sbatch flags of the Harbor environment job (harbor configs only)
 """
 import datetime
@@ -33,7 +33,7 @@ try:
 except ImportError:
     sys.exit("render.py: PyYAML missing. On a LUMI login node: module load cray-python")
 
-SECTIONS = {"slurm", "paths", "model", "layout", "entrypoint", "env", "harbor_env", "skyrl"}
+SECTIONS = {"slurm", "paths", "model", "layout", "entrypoint", "env", "harbor_env", "judge", "skyrl"}
 FREE_FORM = {"skyrl", "env"}  # command-line overrides may add new keys only here
 REF = re.compile(r"\$\{([^}]+)\}")
 
@@ -73,17 +73,17 @@ def apply_override(cfg, item):
 
 
 # ---------------------------------------------------------------- derived values
-def model_source(r):
+def model_source(r, key="model.path"):
     """Directory the nodes stage from: a local dir, or the snapshot of a hub id in hf_home."""
-    path = r.get("model.path")
+    path = r.get(key)
     if os.path.isdir(path):
         return path.rstrip("/")
     snaps = sorted(glob.glob(os.path.join(r.get("paths.hf_home"), "hub",
                                           "models--" + path.replace("/", "--"), "snapshots", "*")))
     if snaps:
         return snaps[0].rstrip("/")
-    r.problem("model.path={}: neither a directory nor a hub id under {}/hub{}".format(
-        path, r.get("paths.hf_home"), SETUP_HINT))
+    r.problem("{}={}: neither a directory nor a hub id under {}/hub{}".format(
+        key, path, r.get("paths.hf_home"), SETUP_HINT))
     return path
 
 
@@ -101,11 +101,21 @@ def inference_gpus(r):
     return r.get("layout.inference_nodes") * r.get("layout.gpus_per_node")
 
 
+def judge_model_source(r):
+    if not r.derived("judge_nodes"):
+        raise ConfigError("judge.nodes=0: the judge runs elsewhere (judge.base_url), no model is staged")
+    return model_source(r, "judge.model.path")
+
+
+JUDGE_ENTRYPOINT = "skyrl_extensions.judge.entrypoint"
 SETUP_HINT = " (a fresh clone needs ./setup.sh first)"
-OPTIONAL_DERIVED = {"max_input_tokens"}  # only meaningful when the config has the keys they read
+# only meaningful when the config has the keys they read
+OPTIONAL_DERIVED = {"max_input_tokens", "judge_served_name", "judge_model_src", "judge_model"}
 DERIVED = {
     # layout
-    "num_nodes": lambda r: r.get("layout.policy_nodes") + r.get("layout.inference_nodes") + r.get("layout.ref_nodes"),
+    "ray_nodes": lambda r: r.get("layout.policy_nodes") + r.get("layout.inference_nodes") + r.get("layout.ref_nodes"),
+    "judge_nodes": lambda r: r.get("judge.nodes") if "judge" in r.cfg else 0,   # vLLM judge servers, outside Ray
+    "num_nodes": lambda r: r.derived("ray_nodes") + r.derived("judge_nodes"),   # the Slurm allocation
     "policy_gpus": lambda r: r.get("layout.policy_nodes") * r.get("layout.gpus_per_node"),
     "ref_gpus": lambda r: r.get("layout.ref_nodes") * r.get("layout.gpus_per_node"),
     "inference_gpus": inference_gpus,
@@ -121,6 +131,10 @@ DERIVED = {
     "model_context": model_context,
     "max_model_len": lambda r: min(r.get("model.max_model_len_cap"), r.derived("model_context")),
     "max_input_tokens": lambda r: r.derived("max_model_len") - r.get("skyrl.generator.sampling_params.max_generate_length"),
+    # judge (configs with a judge: section)
+    "judge_served_name": lambda r: os.path.basename(r.get("judge.model.path").rstrip("/")),
+    "judge_model_src": judge_model_source,
+    "judge_model": lambda r: "/tmp/{}-judge/{}".format(getpass.getuser(), os.path.basename(r.get("judge.model.path").rstrip("/"))),
     # run
     "repo_dir": lambda r: os.path.dirname(os.path.dirname(os.path.abspath(__file__))),  # this clone = the default root
     "config_name": lambda r: r.config_name,
@@ -286,8 +300,34 @@ def check(c):
         workers = h["slurm"]["nodes"] * h["workers_per_node"]
         need(conc <= workers, "generator.rate_limit.max_concurrency={} exceeds the {} Harbor workers "
                               "(harbor_env.slurm.nodes x workers_per_node)".format(conc, workers))
+    j = c.get("judge")
+    judged = lookup(c, "skyrl.environment.env_class") == "judge"
+    if j:
+        need(j["nodes"] >= 0, "judge.nodes must be >= 0")
+        need(bool(j["nodes"]) != bool(j.get("base_url")),
+             "judge: set either nodes >= 1 (vLLM servers in this job) or base_url with nodes: 0 (a server that already runs)")
+        need(L["gpus_per_node"] % j["tp"] == 0, "judge.tp={} must divide gpus_per_node={}".format(j["tp"], L["gpus_per_node"]))
+        need(not j["nodes"] or d.get("judge_model_src"),
+             "judge.model.path={}: neither a directory nor a hub id under {}/hub".format(
+                 lookup(c, "judge.model.path"), c["paths"]["hf_home"]))
+        need(j["name"] in judge_names(), "judge.name={}: not in skyrl_extensions/judge/judges.py ({})".format(
+            j["name"], ", ".join(judge_names())))
+        need(c["entrypoint"]["module"] == JUDGE_ENTRYPOINT,
+             "a judge: section needs entrypoint.module={} (it registers the env)".format(JUDGE_ENTRYPOINT))
+        need(not lookup(c, "skyrl.generator.batched", False),
+             "generator.batched=true runs the judge requests one at a time: set it to false")
+    else:
+        need(not judged, "environment.env_class=judge needs a judge: section (configs/REFERENCE.yaml)")
     if errors:
         raise ConfigError("config checks failed:\n  " + "\n  ".join(errors))
+
+
+def judge_names():
+    """Keys of JUDGES in judges.py, read as text: this runs on the login node's Python, without pydantic."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "skyrl_extensions", "judge", "judges.py")
+    with open(path) as f:
+        m = re.search(r"^JUDGES = \{(.*)\}", f.read(), re.M)
+    return sorted(re.findall(r'"([^"]+)"\s*:', m.group(1))) if m else []
 
 
 def summary(c):
@@ -303,6 +343,12 @@ def summary(c):
         s += " | vLLM {}n TP={} x {} engines".format(L["inference_nodes"], L["tp"], d["num_engines"])
     else:
         s += " | no vLLM"
+    j = c.get("judge")
+    if j and j["nodes"]:
+        s += " | judge {}: {} on {}n TP={} x {} servers".format(
+            j["name"], d["judge_served_name"], j["nodes"], j["tp"], j["nodes"] * L["gpus_per_node"] // j["tp"])
+    elif j:
+        s += " | judge {}: {} at {}".format(j["name"], d["judge_served_name"], j["base_url"])
     s += " | ctx {} | {} tasks x {} samples".format(
         d.get("max_model_len"), lookup(c, "skyrl.trainer.train_batch_size"),
         lookup(c, "skyrl.generator.n_samples_per_prompt", 1))
@@ -354,7 +400,27 @@ def write_run_dir(c, args):
         "ENTRYPOINT_CWD": c["entrypoint"].get("cwd") or "",
         "LAYOUT_SUMMARY": summary(c),
         "HARBOR": 1 if h else 0,
+        "RAY_NODES": d["ray_nodes"],        # nodes that join Ray; the remaining JUDGE_NODES serve the judge
+        "JUDGE_NODES": d["judge_nodes"],
     }
+    j = c.get("judge")
+    if j:
+        job.update({   # read by launch/job.sbatch (role judge) and skyrl_extensions/judge/env.py
+            "JUDGE_NAME": j["name"],
+            "JUDGE_SERVED_NAME": d["judge_served_name"],
+            "JUDGE_MODEL_SRC": d.get("judge_model_src", ""),
+            "JUDGE_MODEL": d["judge_model"],
+            "JUDGE_TP": j["tp"],
+            "JUDGE_PORT": j["port"],
+            "JUDGE_VLLM_ARGS": j.get("vllm_args") or "",
+            "JUDGE_URL": j.get("base_url") or "",
+            "JUDGE_TEMPERATURE": j["temperature"],
+            "JUDGE_MAX_TOKENS": j["max_tokens"],
+            "JUDGE_MAX_CHARS": j["max_chars"],
+            "JUDGE_EXTRA_BODY": json.dumps(j.get("extra_body") or {}),
+            "JUDGE_TIMEOUT_S": j["timeout_s"],
+            "JUDGE_STARTUP_TIMEOUT_S": j["startup_timeout_s"],
+        })
     if h:
         job.update({
             "BRIDGE_FILE": h["bridge_file"],

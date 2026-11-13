@@ -1,0 +1,154 @@
+# so_openq (Nemotron-RL-Science-v1 open questions, 150,644 of them), single-step on-policy RL, reward from the
+# judge of the offline rollouts: same prompt, schema, model and sampling as judge_rollouts.py, same 0..10 score
+# (skyrl_extensions/judge/judges.py, Science). The on-policy counterpart of configs/pregen/.
+# 2 policy nodes (FSDP, SP=4, DP=4) + 2 vLLM nodes (TP=4, 4 engines) + 1 judge node (4 vLLM servers, outside Ray).
+# GRPO, no KL, no reference model. Smoke run: 10 steps, no checkpoint, no export. NOT RUN YET.
+#
+# The prompt is the file's user message (question + "answer in \boxed{}"). so_openq.jsonl has no system message:
+# the tool description the offline rollouts saw was added by that pipeline, so here no tool is offered. A
+# rollout that calls one anyway scores 0 without a judge request (no tool loop: no answer, or an invented output).
+#   environment/reward_so_openq       the reward (0..10), per dataset
+#   environment/judge_answer_correct, judge_bad_reasoning, judge_format_followed   the verdicts
+#   environment/judge_skipped         share of rollouts scored 0 unjudged (tool calls, empty); expect ~0
+#   environment/judge_unparsed        the judge ran out of judge.max_tokens while thinking; expect ~0
+#
+# Data (login node, in the container; 150,444 train + 200 validation rows):
+#   python -m skyrl_extensions.judge.dataset science --out data/so_openq_judge --input so_openq.jsonl
+# More datasets in the same format: add [<name>=]<file>.jsonl to --input; rows carry their dataset's name and
+# judge, judge.name below is the default.
+# Judge model, in hf/ (compute nodes are offline):  HF_HOME=hf hf download Qwen/Qwen3-30B-A3B-Thinking-2507
+# First: configs/single_step/gsm8k_judge.yaml, which checks the same judge server against a rule.
+#
+#   ./submit.sh [--dry-run] configs/single_step/so_openq_judge.yaml [key.path=value ...]
+#
+# Self-contained. Meaning of every key and SkyRL's defaults: configs/REFERENCE.yaml.
+# SkyRL keys not listed keep the default; [SkyRL default: X] marks a value changed from it.
+
+slurm:
+  account: project_465003062
+  partition: dev-g
+  time: "01:00:00"
+  job_name: skyrl-${derived.config_name}
+  cpus_per_task: 56
+  extra: []
+
+paths:
+  root: ${derived.repo_dir}               # this clone, populated by setup.sh
+  sandbox: ${paths.root}/multitorch_sandbox.sif
+  binds: [/var/spool/slurmd, /scratch/project_465003062, /scratch/project_465002038]
+  hf_home: ${paths.root}/hf
+  data: ${paths.root}/data
+  logs: ${paths.root}/logs
+  ckpts: ${paths.root}/ckpts
+  exports: ${paths.root}/exports
+  runs: ${paths.root}/previous_runs
+
+model:
+  path: ${paths.root}/tildeopen
+  max_model_len_cap: 65536
+
+layout:
+  gpus_per_node: 8
+  policy_nodes: 2
+  inference_nodes: 2
+  ref_nodes: 0
+  tp: 4
+  sp: 4
+  ray_port: 6379
+
+entrypoint:
+  module: skyrl_extensions.judge.entrypoint   # main_base + the "judge" env (skyrl_extensions/judge/)
+  cwd: null
+
+judge:
+  name: science                           # skyrl_extensions/judge/judges.py: prompt, answer schema, reward
+  nodes: 1                                # judge nodes, added to the allocation, outside Ray
+  base_url: null
+  model:
+    path: Qwen/Qwen3-30B-A3B-Thinking-2507   # hub id in hf_home, or a dir. The judge of the offline rollouts
+  tp: 2                                   # 8 / tp = 4 servers per judge node
+  port: 8100
+  # reasoning parser: the thinking is returned apart from the JSON verdict (as in judge_rollouts.py)
+  vllm_args: "--reasoning-parser qwen3 --max-model-len 65536 --gpu-memory-utilization 0.9"
+  temperature: 0.6                        # judge_rollouts.py: TEMPERATURE, TOP_P, TOP_K, MAX_TOKENS
+  extra_body: {top_p: 0.95, top_k: 20}
+  max_tokens: 16384                       # the judge's thinking + the JSON verdict
+  max_chars: 120000                       # above max_generate_length in characters: nothing is cut
+  timeout_s: 1800                         # a long think on a busy server
+  startup_timeout_s: 1800
+
+env: {}
+
+skyrl:
+  data:
+    train_data: ["${paths.data}/so_openq_judge/train.parquet"]
+    val_data: ["${paths.data}/so_openq_judge/validation.parquet"]   # judged too: there is no rule
+
+  environment:
+    env_class: judge                      # [SkyRL default: gsm8k] for rows without env_class; ours all have one
+    skyrl_gym:
+      max_env_workers: 64                 # [SkyRL default: 32] judge requests in flight
+
+  trainer:
+    strategy: fsdp
+    logprobs_chunk_size: 512              # [SkyRL default: 1024]
+    placement:
+      colocate_all: false                 # [SkyRL default: true] vLLM on its own nodes
+      colocate_policy_ref: false          # [SkyRL default: true]
+      policy_num_nodes: ${layout.policy_nodes}
+      policy_num_gpus_per_node: ${layout.gpus_per_node}
+      ref_num_nodes: ${layout.ref_nodes}
+      ref_num_gpus_per_node: ${layout.gpus_per_node}
+      critic_num_nodes: ${layout.policy_nodes}
+      critic_num_gpus_per_node: ${layout.gpus_per_node}
+    policy:
+      model:
+        path: ${derived.model}
+      sequence_parallel_size: ${layout.sp}
+      fsdp_config:
+        fsdp_size: ${derived.policy_gpus}
+      optimizer_config:
+        lr: 1.0e-6
+    ref:
+      sequence_parallel_size: ${layout.sp}
+    algorithm:
+      advantage_estimator: grpo
+      loss_reduction: token_mean
+      use_kl_loss: false                  # [SkyRL default: true] no reference model
+      max_seq_len: ${derived.max_model_len}
+
+    epochs: 1
+    max_prompt_length: 4096               # [SkyRL default: 512] longer prompts are DROPPED at load time; the
+                                          # longest so_openq prompt is 2,299 characters
+    max_training_steps: 10                # [SkyRL default: null] test run: stop after 10 steps
+    train_batch_size: 4                   # [SkyRL default: 1024] distinct prompts per step
+    policy_mini_batch_size: 4             # [SkyRL default: 256] prompts per optimizer step
+    micro_train_batch_size_per_gpu: 1
+    micro_forward_batch_size_per_gpu: 1
+    max_tokens_per_microbatch: 65536      # [SkyRL default: -1] token-budget micro batches
+    eval_batch_size: 4                    # [SkyRL default: 1024]
+    eval_before_train: false              # [SkyRL default: true]
+    eval_interval: -1                     # [SkyRL default: 5]
+    ckpt_interval: -1                     # [SkyRL default: 10]
+    resume_mode: null                     # [SkyRL default: latest]
+    ckpt_path: ${paths.ckpts}/${skyrl.trainer.project_name}_${derived.served_name}_ckpt
+    export_path: ${paths.exports}/${skyrl.trainer.project_name}
+    log_path: ${paths.logs}
+    logger: console                       # [SkyRL default: wandb]
+    project_name: so_openq_judge
+    run_name: ${skyrl.trainer.project_name}_lumi_${derived.num_nodes}n_${derived.served_name}_sp${layout.sp}_dp${derived.dp}
+
+  generator:
+    inference_engine:
+      num_engines: ${derived.num_engines}
+      tensor_parallel_size: ${layout.tp}
+      distributed_executor_backend: mp    # [SkyRL default: ray] ray may cause errors here
+      served_model_name: ${derived.served_name}
+      gpu_memory_utilization: 0.8
+      engine_init_kwargs:
+        max_model_len: ${derived.max_model_len}
+    batched: false                        # required: batched=true would judge one completion at a time
+    n_samples_per_prompt: 8               # [SkyRL default: 5] as in the offline rollouts
+    sampling_params:
+      max_generate_length: 8192           # [SkyRL default: 1024] the offline rollouts had the whole 65,536 context
+      temperature: 1.0

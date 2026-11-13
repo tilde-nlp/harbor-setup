@@ -5,12 +5,18 @@
 # Everything else (account, partition, nodes, time, GPUs, output) comes from the run's sbatch_args,
 # written by launch/render.py. Do not sbatch this file directly: use ./submit.sh <config>.
 #
-# SkyRL + FSDP on LUMI, for every task. One file, four roles, selected by the second argument:
+# SkyRL + FSDP on LUMI, for every task. One file, five roles, selected by the second argument:
 #
 #   batch   (default) sbatch runs this on the first node of the allocation. For Harbor, waits for
 #           the environment plane's bridge. Computes RAY_ADDRESS, starts one `node` task per node.
 #   node    one task per node, on the host (outside the container). Asserts the GPU count,
 #           stages the checkpoint to /tmp, enters the container and runs `inner`.
+#           On the last JUDGE_NODES nodes (configs with a judge: section): stages the judge model
+#           and runs `judge` instead.
+#   judge   inside the container, on a judge node, outside Ray. Starts GPUS_PER_NODE / JUDGE_TP vLLM
+#           servers with the judge model, publishes their URLs to $RUN_DIR/judge_urls/<node>.txt once
+#           they are healthy (the driver waits for them: skyrl_extensions/judge/env.py), serves until
+#           the driver has ended. A server that dies ends the job.
 #   inner   inside the container. Applies launch/lumi_env.sh and the config's env:, runs
 #           `ray symmetric-run`, which elects head/workers and runs `train` on the head once every
 #           node joined.
@@ -102,6 +108,14 @@ role_batch() {
     || die "batch host ${SLURMD_NODENAME:-$(hostname)} != first node $HEAD_NODE"
   (( SLURM_JOB_NUM_NODES == NUM_NODES )) \
     || die "allocation has $SLURM_JOB_NUM_NODES nodes, the config's layout needs $NUM_NODES"
+  # The last JUDGE_NODES nodes serve the judge model and do not join Ray (never the head: it is first).
+  JUDGE_NODELIST=$(IFS=,; echo "${NODES[*]:RAY_NODES}")
+  export JUDGE_NODELIST
+  rm -rf "$RUN_DIR/judge_urls" "$RUN_DIR/train.done"
+  if (( JUDGE_NODES )); then
+    mkdir -p "$RUN_DIR/judge_urls" "$RUN_DIR/judge"
+    echo "judge nodes: $JUDGE_NODELIST ($JUDGE_SERVED_NAME, logs in $RUN_DIR/judge)"
+  fi
 
   # Ray control traffic on the Slingshot fabric, not the management network. symmetric-run
   # compares this address against every local interface to elect the head, and passes it to
@@ -135,11 +149,16 @@ role_node() {
   echo "[$SLURMD_NODENAME] route to head: $(ip route get "${RAY_ADDRESS%%:*}" | head -1)"
 
   # Stage the checkpoint into node-local RAM (/tmp): sequential reads instead of mmap page faults
-  # on Lustre. MODEL (the staged path) is what the SkyRL args point at.
-  mkdir -p "$MODEL"
-  echo "[$SLURMD_NODENAME] staging $MODEL_SRC -> $MODEL, timing on the next line:"
+  # on Lustre. MODEL (the staged path) is what the SkyRL args point at. A judge node needs only
+  # the judge model.
+  local role=inner src=$MODEL_SRC dst=$MODEL
+  if [[ ",${JUDGE_NODELIST:-}," == *",$SLURMD_NODENAME,"* ]]; then
+    role=judge src=$JUDGE_MODEL_SRC dst=$JUDGE_MODEL
+  fi
+  mkdir -p "$dst"
+  echo "[$SLURMD_NODENAME] staging $src -> $dst, timing on the next line:"
   TIMEFORMAT="[$SLURMD_NODENAME] staging took %R s"
-  time (ls "$MODEL_SRC" | xargs -P 16 -I{} cp -rL "$MODEL_SRC/{}" "$MODEL/")
+  time (ls "$src" | xargs -P 16 -I{} cp -rL "$src/{}" "$dst/")
 
   # Host RAM of this node every 5 s -> $RUN_DIR/mem/<node>.log (GB). The node is exclusive, so /proc/meminfo is
   # the job: used = total - available, anon = process memory, shmem = /tmp + /dev/shm (staged model, ray object
@@ -150,7 +169,7 @@ role_node() {
         v["MemTotal:"]-v["MemAvailable:"], v["AnonPages:"], v["Shmem:"], v["Cached:"]-v["Shmem:"], v["Dirty:"]+v["Writeback:"]}' /proc/meminfo
     done >> "$RUN_DIR/mem/$SLURMD_NODENAME.log" 2>/dev/null ) &
 
-  exec singularity exec -B "$BINDS" "$SANDBOX" bash "$SELF" "$RUN_DIR" inner
+  exec singularity exec -B "$BINDS" "$SANDBOX" bash "$SELF" "$RUN_DIR" "$role"
 }
 
 # --- role: inner. Inside the container, one per node. ---
@@ -162,7 +181,7 @@ role_inner() {
   # runs on the head node only, once --min-nodes have joined.
   exec ray symmetric-run \
     --address "$RAY_ADDRESS" \
-    --min-nodes "$SLURM_JOB_NUM_NODES" \
+    --min-nodes "$RAY_NODES" \
     --num-cpus="$SLURM_CPUS_PER_TASK" \
     --num-gpus="$GPUS_PER_NODE" \
     --dashboard-host=0.0.0.0 --dashboard-port=8265 \
@@ -176,7 +195,68 @@ role_train() {
   echo "$LAYOUT_SUMMARY"
   echo "python -m $ENTRYPOINT  (${#args[@]} args from $RUN_DIR/skyrl_args)${ENTRYPOINT_CWD:+, cwd $ENTRYPOINT_CWD}"
   if [ -n "$ENTRYPOINT_CWD" ]; then cd "$ENTRYPOINT_CWD"; fi   # modules under examples.* live in /opt/SkyRL
-  exec python -m "$ENTRYPOINT" "${args[@]}" "$@"
+  (( JUDGE_NODES )) || exec python -m "$ENTRYPOINT" "${args[@]}" "$@"
+  # With judge nodes: tell them the driver has ended, whatever the result, so their srun tasks return
+  # and the job ends instead of serving the judge until the time limit.
+  local rc=0
+  python -m "$ENTRYPOINT" "${args[@]}" "$@" || rc=$?
+  touch "$RUN_DIR/train.done"
+  exit "$rc"
+}
+
+# --- role: judge. Inside the container, one per judge node, outside Ray. ---
+# Same pattern as rl-rollgen's lumi/_vllm_node.sh: independent `vllm serve` processes, GPUS_PER_NODE / JUDGE_TP
+# per node, each on its own GPUs and port. No router: the env spreads its requests over the published URLs.
+# The servers have no API key: anyone on the LUMI network can reach them while the job runs.
+role_judge() {
+  apply_env
+  local node=${SLURMD_NODENAME:-$(hostname)} n=$(( GPUS_PER_NODE / JUDGE_TP )) i addr tmp
+  # vLLM's torch.compile / Triton caches default to ~/.cache: the LUMI home quota is 100K files.
+  tmp="/tmp/$USER-judge-cache-${SLURM_JOB_ID:-x}"
+  export XDG_CACHE_HOME="$tmp" VLLM_CACHE_ROOT="$tmp/vllm" TORCHINDUCTOR_CACHE_DIR="$tmp/inductor" TRITON_CACHE_DIR="$tmp/triton"
+  mkdir -p "$VLLM_CACHE_ROOT" "$TORCHINDUCTOR_CACHE_DIR" "$TRITON_CACHE_DIR"
+  # Address the other nodes reach this one at: hsn0 (the container has no `ip`; SIOCGIFADDR = 0x8915).
+  addr=$(python -c 'import fcntl, socket, struct
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+print(socket.inet_ntoa(fcntl.ioctl(s.fileno(), 0x8915, struct.pack("256s", b"hsn0"))[20:24]))') \
+    || die "[$node] no hsn0 address"
+
+  local gpus
+  pids=()   # global: the EXIT trap runs after this function has returned
+  mapfile -t gpus < <(tr ',' '\n' <<< "$HIP_VISIBLE_DEVICES" | grep .)
+  trap 'kill "${pids[@]}" 2>/dev/null || true' EXIT
+  trap 'exit 143' TERM INT HUP
+  for (( i = 0; i < n; i++ )); do
+    echo "[$node] judge server $i: GPUs $(IFS=,; echo "${gpus[*]:i*JUDGE_TP:JUDGE_TP}"), port $(( JUDGE_PORT + i ))"
+    # shellcheck disable=SC2086
+    HIP_VISIBLE_DEVICES=$(IFS=,; echo "${gpus[*]:i*JUDGE_TP:JUDGE_TP}") vllm serve "$JUDGE_MODEL" \
+      --served-model-name "$JUDGE_SERVED_NAME" --tensor-parallel-size "$JUDGE_TP" \
+      --host 0.0.0.0 --port $(( JUDGE_PORT + i )) $JUDGE_VLLM_ARGS > "$RUN_DIR/judge/$node-vllm-$i.log" 2>&1 &
+    pids+=($!)
+  done
+
+  healthy() { python -c 'import sys, urllib.request; urllib.request.urlopen(sys.argv[1], timeout=5)' "$1" 2>/dev/null; }
+  SECONDS=0
+  for (( i = 0; i < n; i++ )); do
+    until healthy "http://127.0.0.1:$(( JUDGE_PORT + i ))/health"; do
+      kill -0 "${pids[i]}" 2>/dev/null || die "[$node] judge server $i died during startup, see $RUN_DIR/judge/$node-vllm-$i.log"
+      (( SECONDS < JUDGE_STARTUP_TIMEOUT_S )) || die "[$node] judge server $i not healthy after ${JUDGE_STARTUP_TIMEOUT_S}s"
+      sleep 10
+    done
+  done
+  for (( i = 0; i < n; i++ )); do echo "http://$addr:$(( JUDGE_PORT + i ))/v1"; done > "$RUN_DIR/judge_urls/$node.tmp"
+  mv "$RUN_DIR/judge_urls/$node.tmp" "$RUN_DIR/judge_urls/$node.txt"   # atomic: the driver never reads a partial file
+  echo "[$node] $n judge server(s) healthy after ${SECONDS}s at $addr"
+
+  # Serve until the driver has ended (role train touches train.done). A dead server ends the job
+  # (srun --kill-on-bad-exit): the env would otherwise retry against it and then fail the run anyway.
+  until [ -e "$RUN_DIR/train.done" ]; do
+    for (( i = 0; i < n; i++ )); do
+      kill -0 "${pids[i]}" 2>/dev/null || die "[$node] judge server $i exited, see $RUN_DIR/judge/$node-vllm-$i.log"
+    done
+    sleep 10
+  done
+  echo "[$node] driver ended: stopping the judge servers"
 }
 
 # --- dispatch ---
@@ -196,6 +276,7 @@ case "$role" in
   batch) role_batch ;;
   node)  role_node ;;
   inner) role_inner ;;
+  judge) role_judge ;;
   train) role_train "$@" ;;
-  *)     die "usage: job.sbatch <run_dir> [batch|node|inner|train]   (or: source job.sbatch <run_dir>)" ;;
+  *)     die "usage: job.sbatch <run_dir> [batch|node|inner|judge|train]   (or: source job.sbatch <run_dir>)" ;;
 esac
