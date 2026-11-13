@@ -1,6 +1,7 @@
-# so_openq (Nemotron-RL-Science-v1 open questions, 150,644 of them), single-step on-policy RL, reward from the
-# judge of the offline rollouts: same prompt, schema, model and sampling as judge_rollouts.py, same 0..10 score
-# (skyrl_extensions/judge/judges.py, Science). The on-policy counterpart of configs/pregen/.
+# so_openq (Nemotron-RL-Science-v1 open questions, 150,644 of them), single-step on-policy RL, reward from a
+# judge: the prompt, schema and 0..10 score of the offline rollouts (judge_rollouts.py; judges.py, Science).
+# The judge MODEL is not the offline one: Gemma 4 31B-it without thinking instead of Qwen3-30B-A3B-Thinking,
+# so the verdict comes without any reasoning before it, and scores are not comparable with the offline ones.
 # 2 policy nodes (FSDP, SP=4, DP=4) + 2 vLLM nodes (TP=4, 4 engines) + 1 judge node (4 vLLM servers, outside Ray).
 # GRPO, no KL, no reference model. Smoke run: 10 steps, no checkpoint, no export. NOT RUN YET.
 #
@@ -10,13 +11,13 @@
 #   environment/reward_so_openq       the reward (0..10), per dataset
 #   environment/judge_answer_correct, judge_bad_reasoning, judge_format_followed   the verdicts
 #   environment/judge_skipped         share of rollouts scored 0 unjudged (tool calls, empty); expect ~0
-#   environment/judge_unparsed        the judge ran out of judge.max_tokens while thinking; expect ~0
+#   environment/judge_unparsed        replies that are not the verdict JSON; expect 0
 #
 # Data (login node, in the container; 150,444 train + 200 validation rows):
 #   python -m skyrl_extensions.judge.dataset science --out data/so_openq_judge --input so_openq.jsonl
 # More datasets in the same format: add [<name>=]<file>.jsonl to --input; rows carry their dataset's name and
 # judge, judge.name below is the default.
-# Judge model, in hf/ (compute nodes are offline):  HF_HOME=hf hf download Qwen/Qwen3-30B-A3B-Thinking-2507
+# Judge model, in hf/ (compute nodes are offline):  google/gemma-4-31B-it in judge.model.hf_home
 # First: configs/single_step/gsm8k_judge.yaml, which checks the same judge server against a rule.
 #
 #   ./submit.sh [--dry-run] configs/single_step/so_openq_judge.yaml [key.path=value ...]
@@ -65,16 +66,17 @@ judge:
   nodes: 1                                # judge nodes, added to the allocation, outside Ray
   base_url: null
   model:
-    path: Qwen/Qwen3-30B-A3B-Thinking-2507   # hub id in hf_home, or a dir. The judge of the offline rollouts
-  tp: 2                                   # 8 / tp = 4 servers per judge node
+    path: google/gemma-4-31B-it           # hub id in model.hf_home, or a dir
+    hf_home: /scratch/project_465003062/environment/containers/fsdp-skyrl-harbor/hf   # where it was downloaded (rl-rollgen's cache)
+  tp: 2                                   # 8 / tp = 4 servers per judge node (as in rl-rollgen's Gemma jobs)
   port: 8100
-  # reasoning parser: the thinking is returned apart from the JSON verdict (as in judge_rollouts.py)
-  vllm_args: "--reasoning-parser qwen3 --max-model-len 65536 --gpu-memory-utilization 0.9"
-  temperature: 0.6                        # judge_rollouts.py: TEMPERATURE, TOP_P, TOP_K, MAX_TOKENS
-  extra_body: {top_p: 0.95, top_k: 20}
-  max_tokens: 16384                       # the judge's thinking + the JSON verdict
-  max_chars: 120000                       # above max_generate_length in characters: nothing is cut
-  timeout_s: 1800                         # a long think on a busy server
+  vllm_args: "--max-model-len 32768 --gpu-memory-utilization 0.9"
+  temperature: 0.0
+  extra_body:                             # no thinking block: the reply is the JSON verdict
+    chat_template_kwargs: {enable_thinking: false}
+  max_tokens: 64                          # the verdict only: four JSON fields, no reasoning
+  max_chars: 60000                        # longer completions are cut (head + tail) in the judge's prompt
+  timeout_s: 600
   startup_timeout_s: 1800
 
 env: {}

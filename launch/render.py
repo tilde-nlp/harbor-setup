@@ -73,17 +73,18 @@ def apply_override(cfg, item):
 
 
 # ---------------------------------------------------------------- derived values
-def model_source(r, key="model.path"):
+def model_source(r, key="model.path", hf_home=None):
     """Directory the nodes stage from: a local dir, or the snapshot of a hub id in hf_home."""
     path = r.get(key)
+    hf_home = hf_home or r.get("paths.hf_home")
     if os.path.isdir(path):
         return path.rstrip("/")
-    snaps = sorted(glob.glob(os.path.join(r.get("paths.hf_home"), "hub",
+    snaps = sorted(glob.glob(os.path.join(hf_home, "hub",
                                           "models--" + path.replace("/", "--"), "snapshots", "*")))
     if snaps:
         return snaps[0].rstrip("/")
     r.problem("{}={}: neither a directory nor a hub id under {}/hub{}".format(
-        key, path, r.get("paths.hf_home"), SETUP_HINT))
+        key, path, hf_home, SETUP_HINT))
     return path
 
 
@@ -104,7 +105,8 @@ def inference_gpus(r):
 def judge_model_source(r):
     if not r.derived("judge_nodes"):
         raise ConfigError("judge.nodes=0: the judge runs elsewhere (judge.base_url), no model is staged")
-    return model_source(r, "judge.model.path")
+    # judge.model.hf_home: the judge model may live in another HF cache than the run's (paths.hf_home)
+    return model_source(r, "judge.model.path", lookup(r.cfg, "judge.model.hf_home") and r.get("judge.model.hf_home"))
 
 
 JUDGE_ENTRYPOINT = "skyrl_extensions.judge.entrypoint"
@@ -309,7 +311,7 @@ def check(c):
         need(L["gpus_per_node"] % j["tp"] == 0, "judge.tp={} must divide gpus_per_node={}".format(j["tp"], L["gpus_per_node"]))
         need(not j["nodes"] or d.get("judge_model_src"),
              "judge.model.path={}: neither a directory nor a hub id under {}/hub".format(
-                 lookup(c, "judge.model.path"), c["paths"]["hf_home"]))
+                 lookup(c, "judge.model.path"), lookup(c, "judge.model.hf_home") or c["paths"]["hf_home"]))
         need(j["name"] in judge_names(), "judge.name={}: not in skyrl_extensions/judge/judges.py ({})".format(
             j["name"], ", ".join(judge_names())))
         need(c["entrypoint"]["module"] == JUDGE_ENTRYPOINT,

@@ -15,7 +15,7 @@
 #   python -m skyrl_extensions.judge.dataset gsm8k --src data --out data/gsm8k_judge
 # Judge model: the one of the science task (configs/single_step/so_openq_judge.yaml), served the same way, so
 # this run also tests that server. Must be in hf/ (compute nodes are offline):
-#   HF_HOME=hf hf download Qwen/Qwen3-30B-A3B-Thinking-2507
+#   google/gemma-4-31B-it, already in judge.model.hf_home
 #
 #   ./submit.sh [--dry-run] configs/single_step/gsm8k_judge.yaml [key.path=value ...]
 #
@@ -63,14 +63,15 @@ judge:
   nodes: 1                                # judge nodes, added to the allocation, outside Ray
   base_url: null
   model:
-    path: Qwen/Qwen3-30B-A3B-Thinking-2507   # hub id in hf_home, or a dir. The judge of the offline rollouts
-  tp: 2                                   # 8 / tp = 4 servers per judge node
+    path: google/gemma-4-31B-it           # hub id in model.hf_home, or a dir
+    hf_home: /scratch/project_465003062/environment/containers/fsdp-skyrl-harbor/hf   # where it was downloaded (rl-rollgen's cache)
+  tp: 2                                   # 8 / tp = 4 servers per judge node (as in rl-rollgen's Gemma jobs)
   port: 8100
-  # reasoning parser: the thinking is returned apart from the JSON verdict (as in judge_rollouts.py)
-  vllm_args: "--reasoning-parser qwen3 --max-model-len 32768 --gpu-memory-utilization 0.9"
-  temperature: 0.6                        # Qwen3 thinking models' recommended sampling (greedy can loop)
-  extra_body: {top_p: 0.95, top_k: 20}
-  max_tokens: 4096                        # the judge's thinking + the JSON verdict
+  vllm_args: "--max-model-len 32768 --gpu-memory-utilization 0.9"
+  temperature: 0.0
+  extra_body:                             # no thinking block: the reply is the JSON verdict
+    chat_template_kwargs: {enable_thinking: false}
+  max_tokens: 512                         # the judge's reply (short reasoning + verdict, JSON)
   max_chars: 20000                        # longer completions are cut (head + tail) in the judge's prompt
   timeout_s: 600
   startup_timeout_s: 1800

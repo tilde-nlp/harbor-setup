@@ -104,6 +104,7 @@ judge:                            # judge configs only (entrypoint skyrl_extensi
   # this means another job on LUMI, not an external API
   model:
     path: Qwen/Qwen3-30B-A3B-Thinking-2507
+    # hf_home: /scratch/.../hf    optional: the HF cache the hub id is in, when it is not paths.hf_home
     # dir, or hub id downloaded to hf_home; staged to /tmp on the judge nodes. Its basename is the served
     # name. Must be instruction-tuned (a base model cannot follow the rubric)
   tp: 2                           # tensor parallel per judge server; must divide gpus_per_node
