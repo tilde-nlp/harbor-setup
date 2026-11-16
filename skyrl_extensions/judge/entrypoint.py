@@ -19,8 +19,30 @@ import ray
 
 from skyrl.train.config import SkyRLTrainConfig
 from skyrl.train.entrypoints.main_base import BasePPOExp
+from skyrl.train.trainer import RayPPOTrainer
 from skyrl.train.utils import validate_cfg
 from skyrl.train.utils.utils import initialize_ray
+
+
+class JudgeTrainer(RayPPOTrainer):
+    def build_models(self, PolicyWorker, CriticWorker, RefWorker):
+        # With a reference on the policy GPUs (use_kl_loss, layout.ref_nodes 0) the workers offload to host RAM,
+        # and SkyRL then binds each worker's memory strictly to one NUMA node: rank 0 cannot gather the model
+        # for the HF export (host OOM, notes/BUGS.md). SpillPolicyWorker lets the memory spill over; its export
+        # also copies the start model's tokenizer files. Same worker as the pregenerated runs.
+        if self.cfg.trainer.strategy == "fsdp":
+            from skyrl_extensions.pregenerated.entrypoint import SpillPolicyWorker
+            PolicyWorker = SpillPolicyWorker
+        return super().build_models(PolicyWorker, CriticWorker, RefWorker)
+
+
+class JudgeExp(BasePPOExp):
+    def get_trainer(self, cfg, tracker, tokenizer, train_dataset, eval_dataset, inference_engine_client, generator, colocate_pg):
+        return JudgeTrainer(
+            cfg=cfg, tracker=tracker, tokenizer=tokenizer, train_dataset=train_dataset,
+            eval_dataset=eval_dataset, inference_engine_client=inference_engine_client,
+            generator=generator, colocate_pg=colocate_pg,
+        )
 
 
 @ray.remote(num_cpus=1)
@@ -32,7 +54,7 @@ def skyrl_entrypoint(cfg):
 
     env.connect(wait_s=int(os.environ.get("JUDGE_STARTUP_TIMEOUT_S", "1800")))
     register(id="judge", entry_point="skyrl_extensions.judge.env:JudgeEnv")
-    BasePPOExp(cfg).run()
+    JudgeExp(cfg).run()
 
 
 def main() -> None:

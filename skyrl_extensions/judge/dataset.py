@@ -9,7 +9,8 @@ The validation rows keep env_class "gsm8k": evaluation stays rule-based, indepen
 
 science: the training data, a collection of datasets. Each input is a jsonl in the Nemotron-RL format
 (responses_create_params.input = the prompt messages, expected_answer, problem; so_openq.jsonl, or the same
-records with rollouts: only the prompt and the reference answer are read). One row per question. Every row
+records with rollouts: only the prompt and the reference answer are read), or in the queries format
+(uuid, prompt = the prompt messages, expected_answer; so_openq.online.queries.jsonl). One row per question. Every row
 carries its dataset's name (data_source: reward is logged per dataset, environment/reward_<name>) and its
 judge (reward_spec.judge), so datasets graded by different judges can be mixed in one run.
 
@@ -59,7 +60,9 @@ def science(args):
         with open(path) as f:
             for i, line in enumerate(f):
                 rec = json.loads(line)
-                prompt = [{"role": m["role"], "content": m["content"]} for m in rec["responses_create_params"]["input"]]
+                # the Nemotron-RL record, or the queries format {uuid, prompt: [messages], expected_answer}
+                messages = rec["prompt"] if "prompt" in rec else rec["responses_create_params"]["input"]
+                prompt = [{"role": m["role"], "content": m["content"]} for m in messages]
                 assert all(isinstance(m["content"], str) for m in prompt), "{} record {}: message content is not text".format(path, i)
                 if args.drop_system:
                     prompt = [m for m in prompt if m["role"] != "system"]
