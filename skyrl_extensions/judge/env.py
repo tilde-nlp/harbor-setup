@@ -24,7 +24,9 @@ batched=true for a judge config.
 
 Logged per step, mean over the trajectories (environment/<name>):
     judge_unparsed      share of replies that did not fit the schema (reward 0). Should be 0. With a thinking
-                        judge: it ran out of judge.max_tokens before the verdict.
+                        judge: it ran out of judge.max_tokens before the verdict. Every such case is a line of
+                        $RUN_DIR/judge_unparsed.jsonl (JudgeClient.log_unparsed): which question, the response,
+                        what the judge wrote.
     judge_skipped       share decided without the judge (empty completion, judge's precheck)
     judge_seconds       request latency
     judge_<field>       every bool / number the judge answered, e.g. judge_correct
@@ -105,6 +107,8 @@ class JudgeClient:
                         for u in self.urls]
         self._next = itertools.count()
         self._unparsed_shown = 0
+        self._unparsed_lock = threading.Lock()
+        self.unparsed_path = os.path.join(env["RUN_DIR"], "judge_unparsed.jsonl") if env.get("RUN_DIR") else None
         print("judge '{}': model {} on {} server(s): {}".format(env["JUDGE_NAME"], self.model, len(self.urls), " ".join(self.urls)), flush=True)
 
     def judge_for(self, extras):
@@ -134,7 +138,30 @@ class JudgeClient:
                 self._unparsed_shown += 1
                 print("judge reply does not fit Output (finish_reason={}, reward 0): {} | reply: {!r}".format(
                     resp.choices[0].finish_reason, (str(e).splitlines() or [""])[0], text[:500]), flush=True)
+            self.log_unparsed(r, resp, text, e)
             return None, text
+
+    def log_unparsed(self, r, resp, text, error):
+        """One line per reply that did not fit the schema (reward 0): $RUN_DIR/judge_unparsed.jsonl."""
+        if not self.unparsed_path:
+            return
+        choice, extras = resp.choices[0], r["extras"]
+        reasoning = getattr(choice.message, "reasoning_content", None) or getattr(choice.message, "reasoning", None) or ""
+        row = {
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "uuid": (extras.get("extra_info") or {}).get("uuid"),
+            "data_source": extras.get("data_source"),
+            "finish_reason": choice.finish_reason,     # "length": the judge ran out of judge.max_tokens
+            "judge_tokens": getattr(resp.usage, "completion_tokens", None),
+            "error": (str(error).splitlines() or [""])[0],
+            "reply": text[:2000],
+            "judge_reasoning_tail": reasoning[-2000:],
+            "completion_chars": len(r["completion"]),
+            "completion": truncate(r["completion"], 20000),
+        }
+        with self._unparsed_lock:
+            with open(self.unparsed_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
 _client = None

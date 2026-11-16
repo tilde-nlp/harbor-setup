@@ -113,10 +113,14 @@ def test_dead_judge_raises_instead_of_scoring_zero(judge):
     assert len(judge.requests) == 2                                 # one retry (JUDGE_RETRIES=1), then the error
 
 
-def test_unparsed_reply_scores_zero_and_is_counted(judge):
+def test_unparsed_reply_scores_zero_and_is_counted(judge, monkeypatch, tmp_path):
+    monkeypatch.setenv("RUN_DIR", str(tmp_path))
     judge.mode = "garbage"
-    reward, m = step("#### 18")
+    reward, m = step("#### 18", extras=dict(EXTRAS, data_source="gsm8k", extra_info=dict(EXTRAS["extra_info"], uuid="u1")))
     assert reward == 0.0 and m["judge_unparsed"] == 1.0 and "judge_correct" not in m
+    rows = [json.loads(line) for line in open(tmp_path / "judge_unparsed.jsonl")]   # every case is logged
+    assert len(rows) == 1 and rows[0]["uuid"] == "u1" and rows[0]["data_source"] == "gsm8k"
+    assert rows[0]["completion"] == "#### 18" and rows[0]["finish_reason"] == "stop" and rows[0]["error"]
 
 
 def test_empty_completion_is_not_sent(judge):
