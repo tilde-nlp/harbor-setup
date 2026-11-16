@@ -13,13 +13,17 @@
 #                   prompt (longest: 518 tokens). A step waits for its longest rollout at ~0.038 s/token: a rollout
 #                   that runs to the cap takes ~39 min. Offline: 1.8% of rollouts reach 8k tokens, 0.19% 16k, 0.01% 32k.
 #   judge model     Qwen3-30B-A3B-Thinking-2507 (was Gemma 4 31B-it without thinking) and its offline sampling:
-#                   see above. NOT RUN YET with this judge: its latency and throughput here are unknown (Gemma:
-#                   2.4 s per request). A verdict that does not fit in 16,384 tokens scores 0 (judge_unparsed).
-#   layout          5 nodes (was 10): 2 policy (SP=4, DP=4) + 2 vLLM (4 engines) + 1 judge (4 servers).
-#                   The tail of a step runs almost alone, so engines sit idle: 2 vLLM nodes. 512 judge requests
-#                   per step on 1 node: enough if judging stays short next to the generation; check
-#                   environment/judge_seconds in step 1. 2 policy nodes hold 65,536-token sequences (job 22993191);
-#                   training is ~2x slower per step (~110 s -> ~220 s), small next to the generation time.
+#                   see above. Smoke job 23789352: ~2,630 tokens (thinking + verdict) and 92-102 s per request
+#                   (Gemma: 2.4 s), 0 unparsed. A verdict that does not fit in 16,384 tokens scores 0
+#                   (judge_unparsed; each one is a line of <run dir>/judge_unparsed.jsonl).
+#   layout          7 nodes (was 10): 4 policy (SP=4, DP=8) + 2 vLLM (4 engines) + 1 judge (4 servers).
+#                   Policy: 2 nodes ran out of GPU memory in the backward pass of step 2 (job 23789352: 56.5 GB
+#                   allocated of 64 GB, 8k generation cap; step 1 has lr 0, the optimizer state comes after it).
+#                   4 nodes with the reference on them ran 100 steps with sequences up to 47k tokens (job 23683421).
+#                   vLLM: the tail of a step runs almost alone, so engines sit idle: 2 nodes (mean rollout time
+#                   was the same with 4 engines as with 8). Judge: one node is saturated at ~850 tokens/s per
+#                   server, 512 requests take ~8 min. With offline-like lengths the longest rollout of a step
+#                   (~12 min) outlasts that; if rollouts rarely run away, judge.nodes=2 shortens the steps.
 #   judge context   --max-model-len 131072 (was 32768), judge.max_chars 100,000 (was 60,000). The offline judge saw
 #                   the whole response; here a longer one is still cut (head 2/3 + tail 1/3), because a rejected
 #                   judge request ends the run: 100,000 characters + 16,384 output tokens fit even at 1 token
@@ -30,18 +34,23 @@
 #   KL              use_kl_loss with SkyRL's defaults: loss = policy loss + 0.001 x KL(policy || reference), k3
 #                   estimator (policy/policy_kl in the log). The reference is the start checkpoint, frozen, on the
 #                   policy GPUs (layout.ref_nodes 0): SkyRL swaps the two models, they are never on the GPUs together
-#                   (ran like this on 4 policy nodes: configs/pregen, job 23682492). NOT RUN YET on 2 policy nodes:
-#                   each node's host RAM holds twice the share of the swapped-out model, and a step gains one
-#                   reference forward pass over all rollouts. Own reference nodes instead: layout.ref_nodes=2.
+#                   (ran like this on 4 policy nodes: configs/pregen, jobs 23682492, 23683421). A step gains one
+#                   reference forward pass over all rollouts. The HF export needs SpillPolicyWorker for this
+#                   (skyrl_extensions/judge/entrypoint.py; 77 s in job 23789352). Own reference nodes instead:
+#                   layout.ref_nodes=4 (saves ~35 s per step).
 #                   Before evaluating: ./check.sh export <export dir>/global_step_N --base tildeopen
 #   watchdog        HANG_TIMEOUT_MIN=60 (default 15), passed through sbatch --export in slurm.extra: the log can be
 #                   silent for most of a 39-minute generation, and the watchdog would cancel the job as hung.
 #   excluded nodes  nid[005018-005021]: hangs in the first forward pass (notes/BUGS.md).
-#   time            48 h (standard-g maximum). Expected 15-25 h; it depends on how many rollouts run away.
+#   time            36 h. Expected ~25 h with offline-like rollout lengths: per step ~12.4 min generation + judging
+#                   and ~160 s training (57 s forward passes + 98 s update in job 23683421), plus 16 min start-up
+#                   and 4 saves. ~18.5 h if rollouts rarely run away (then the judge sets the pace), ~35 h if the
+#                   longest rollout averages 30k tokens: that does not leave room in 36 h (standard-g allows 48 h).
 #
 # Not changed, to know about: loss_reduction token_mean. One 61k-token rollout is ~10% of a step's tokens, so
 # runaway rollouts weigh heavily in the gradient (sequence_mean would weigh every rollout the same).
-# NOT RUN YET with this layout and cap: check the first step's timings and environment/judge_* before leaving it.
+# NOT RUN YET: 4 policy nodes together with this judge, and the 61,440 cap. Check the first two steps (step 2 is
+# the first with the optimizer state on the GPUs) and environment/judge_* before leaving it.
 # Not exercised anywhere yet: a single generation request that stays open for ~40 min.
 #
 #   environment/reward_so_openq       the reward (0..10)
@@ -63,7 +72,7 @@
 slurm:
   account: project_465003062
   partition: standard-g
-  time: "36:00:00"
+  time: "40:00:00"
   job_name: skyrl-${derived.config_name}
   cpus_per_task: 56
   extra:
@@ -87,7 +96,7 @@ model:
 
 layout:
   gpus_per_node: 8
-  policy_nodes: 2                         # 16 GCDs, DP = 16 / sp = 4
+  policy_nodes: 4                         # 32 GCDs, DP = 32 / sp = 8
   inference_nodes: 2                      # 4 engines
   ref_nodes: 0                            # 0: ref on the policy GPUs; > 0: own nodes (placement follows)
   tp: 4
@@ -147,7 +156,7 @@ skyrl:
       fsdp_config:
         fsdp_size: ${derived.policy_gpus}
       optimizer_config:
-        lr: 1.0e-5                        # [SkyRL default: 1.0e-6] the update has to survive the bf16 cast
+        lr: 3.0e-6                        # [SkyRL default: 1.0e-6] the update has to survive the bf16 cast
         num_warmup_steps: 3               # [SkyRL default: 0] linear from 0, then constant
     ref:
       sequence_parallel_size: ${layout.sp}
