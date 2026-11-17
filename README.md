@@ -17,3 +17,12 @@ mkdir <dir> && cd <dir> && git clone <repo url> . && ./setup.sh [<from_root>]   
 | `notes/` | bugs and experiments worth remembering |
 
 The clone is the working root (`paths.root`); everything `setup.sh` and the runs add is git-ignored. Every submission gets `previous_runs/<timestamp>-<run>/`: resolved config, SkyRL args, code snapshot, Slurm and NCCL logs. The layout before this one: `git checkout pre-restructure`.
+
+
+### Convert fp32 to bf16 hf export
+
+```
+cd /scratch/project_465003062/environment/containers/grpo-pregen-rl
+bash replay/in_sandbox.sh hf_to_bf16 \
+  /scratch/project_465003062/environment/containers/skyrl-training/exports/so_openq_online_lr1e-5/global_step_25/policy
+```
