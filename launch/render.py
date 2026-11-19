@@ -17,7 +17,7 @@ Writes into <paths.runs>/<timestamp>-<config name>/:
     job.env                variables for launch/job.sbatch and launch/harbor_env.sbatch
     env.sh                 the config's `env:` section, applied after launch/lumi_env.sh
     sbatch_args            sbatch flags of the training job (nodes = sum of layout nodes + judge.nodes)
-    harbor_env.sbatch_args sbatch flags of the Harbor environment job (harbor configs only)
+    harbor_env.sbatch_args sbatch flags of the Harbor environment job (harbor configs with sandboxes on LUMI)
 """
 import datetime
 import getpass
@@ -109,7 +109,9 @@ def judge_model_source(r):
     return model_source(r, "judge.model.path", lookup(r.cfg, "judge.model.hf_home") and r.get("judge.model.hf_home"))
 
 
-JUDGE_ENTRYPOINT = "skyrl_extensions.judge.entrypoint"
+JUDGE_ENTRYPOINT = "skyrl_extensions.judge.entrypoint"                # single-step, the "judge" env
+HARBOR_JUDGE_ENTRYPOINT = "skyrl_extensions.harbor_judge.entrypoint"  # Harbor trials, the judge grades each one
+SANDBOXES = ("lumi", "tilde")   # harbor_env.sandboxes: apptainer workers in a LUMI job, or Docker on Tilde
 SETUP_HINT = " (a fresh clone needs ./setup.sh first)"
 # only meaningful when the config has the keys they read
 OPTIONAL_DERIVED = {"max_input_tokens", "judge_served_name", "judge_model_src", "judge_model"}
@@ -298,12 +300,26 @@ def check(c):
 
     h = c.get("harbor_env")
     conc = lookup(c, "skyrl.generator.rate_limit.max_concurrency")
-    if h and h.get("submit") and conc is not None:
-        workers = h["slurm"]["nodes"] * h["workers_per_node"]
-        need(conc <= workers, "generator.rate_limit.max_concurrency={} exceeds the {} Harbor workers "
-                              "(harbor_env.slurm.nodes x workers_per_node)".format(conc, workers))
+    if h:
+        where = h.get("sandboxes", "lumi")
+        need(where in SANDBOXES, "harbor_env.sandboxes={}: one of {}".format(where, ", ".join(SANDBOXES)))
+        need(lookup(c, "skyrl.harbor_trial_config.environment.type") == "apptainer",
+             "harbor_env: the trials reach their sandboxes through the bridge, which needs "
+             "skyrl.harbor_trial_config.environment.type=apptainer (marin-harbor's bridge client)")
+        if where == "lumi" and h.get("submit") and conc is not None:
+            workers = h["slurm"]["nodes"] * h["workers_per_node"]
+            need(conc <= workers, "generator.rate_limit.max_concurrency={} exceeds the {} Harbor workers "
+                                  "(harbor_env.slurm.nodes x workers_per_node)".format(conc, workers))
+        if where == "tilde":
+            need(conc is not None and conc >= 1, "harbor_env.sandboxes=tilde: set skyrl.generator.rate_limit.max_concurrency "
+                                                 "(the job waits for that many sandbox slots on Tilde)")
     j = c.get("judge")
     judged = lookup(c, "skyrl.environment.env_class") == "judge"
+    entry = c["entrypoint"]["module"]
+    if entry == HARBOR_JUDGE_ENTRYPOINT:
+        need(j, "entrypoint {} needs a judge: section (configs/REFERENCE.yaml)".format(entry))
+        need(lookup(c, "skyrl.harbor_trial_config") is not None, "entrypoint {} runs Harbor trials: it needs "
+                                                                 "skyrl.harbor_trial_config".format(entry))
     if j:
         need(j["nodes"] >= 0, "judge.nodes must be >= 0")
         need(bool(j["nodes"]) != bool(j.get("base_url")),
@@ -314,8 +330,9 @@ def check(c):
                  lookup(c, "judge.model.path"), lookup(c, "judge.model.hf_home") or c["paths"]["hf_home"]))
         need(j["name"] in judge_names(), "judge.name={}: not in skyrl_extensions/judge/judges.py ({})".format(
             j["name"], ", ".join(judge_names())))
-        need(c["entrypoint"]["module"] == JUDGE_ENTRYPOINT,
-             "a judge: section needs entrypoint.module={} (it registers the env)".format(JUDGE_ENTRYPOINT))
+        need(entry in (JUDGE_ENTRYPOINT, HARBOR_JUDGE_ENTRYPOINT),
+             "a judge: section needs entrypoint.module={} (single-step: it registers the env) or {} (Harbor trials)".format(
+                 JUDGE_ENTRYPOINT, HARBOR_JUDGE_ENTRYPOINT))
         need(not lookup(c, "skyrl.generator.batched", False),
              "generator.batched=true runs the judge requests one at a time: set it to false")
     else:
@@ -351,6 +368,8 @@ def summary(c):
             j["name"], d["judge_served_name"], j["nodes"], j["tp"], j["nodes"] * L["gpus_per_node"] // j["tp"])
     elif j:
         s += " | judge {}: {} at {}".format(j["name"], d["judge_served_name"], j["base_url"])
+    if lookup(c, "harbor_env.sandboxes") == "tilde":
+        s += " | sandboxes: Docker on Tilde"
     s += " | ctx {} | {} tasks x {} samples".format(
         d.get("max_model_len"), lookup(c, "skyrl.trainer.train_batch_size"),
         lookup(c, "skyrl.generator.n_samples_per_prompt", 1))
@@ -423,22 +442,33 @@ def write_run_dir(c, args):
             "JUDGE_TIMEOUT_S": j["timeout_s"],
             "JUDGE_STARTUP_TIMEOUT_S": j["startup_timeout_s"],
         })
+    where = h.get("sandboxes", "lumi") if h else None
     if h:
+        job.update({
+            "HARBOR_SANDBOXES": where,
+            "HARBOR_BRIDGE_PORT": h["bridge_port"],
+            "HARBOR_APPTAINER_DIR": h["apptainer_dir"],
+        })
+    if where == "lumi":
         job.update({
             "BRIDGE_FILE": h["bridge_file"],
             "HARBOR_WORKERS_PER_NODE": h["workers_per_node"],
-            "HARBOR_BRIDGE_PORT": h["bridge_port"],
-            "HARBOR_APPTAINER_DIR": h["apptainer_dir"],
             "HARBOR_SIF_CACHE": h["sif_cache"],
             "SINGULARITY_CACHEDIR": h["singularity_cachedir"],
             "BRIDGE_USE_FAKEROOT": h["use_fakeroot"],
+        })
+    if where == "tilde":
+        job.update({   # read by launch/job.sbatch (start_tilde_bridge); tilde/harbor_workers.sh reads bridge.url
+            "BRIDGE_FILE": os.path.join(run_dir, "bridge.url"),
+            "HARBOR_MIN_CAPACITY": lookup(c, "skyrl.generator.rate_limit.max_concurrency"),
+            "HARBOR_TILDE_WAIT_MIN": h["tilde_wait_min"],
         })
     write_lines(os.path.join(run_dir, "job.env"), ["# generated by launch/render.py"] + exports(job))
     write_lines(os.path.join(run_dir, "env.sh"), ["# config `env:` section, applied after launch/lumi_env.sh"]
                 + exports(c.get("env") or {}))
     write_lines(os.path.join(run_dir, "sbatch_args"),
                 sbatch_flags(c["slurm"], d["num_nodes"], os.path.join(run_dir, "slurm-%j.out"), L["gpus_per_node"]))
-    if h and h["submit"]:
+    if where == "lumi" and h["submit"]:
         hs = dict(c["slurm"], **h["slurm"])
         hs["job_name"] = h["slurm"].get("job_name", "harbor-env-" + d["config_name"])
         hs["extra"] = h["slurm"].get("extra", [])

@@ -13,9 +13,11 @@
 !/notes/
 !/checks/
 !/tools/
+!/tilde/
 !/notebooks/
 !/check.sh
 /checks/results/
 
 __pycache__/
 *.py[oc]
+

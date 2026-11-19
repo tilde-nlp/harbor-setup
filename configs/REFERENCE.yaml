@@ -81,7 +81,8 @@ entrypoint:
   #   examples.train_integrations.harbor.entrypoints.main_harbor   (adds harbor_trial_config, generator.rate_limit)
   #   skyrl_extensions.pregenerated.entrypoint                     (ours, skyrl_extensions/)
   #   skyrl_extensions.judge.entrypoint                            (ours; main_base + the "judge" env, needs judge:)
-  cwd: null                       # /opt/SkyRL for modules under examples.*
+  #   skyrl_extensions.harbor_judge.entrypoint                     (ours; main_harbor, reward from judge:; cwd /opt/SkyRL)
+  cwd: null                       # /opt/SkyRL for modules under examples.* (and the Harbor judge entrypoint)
 
 env: {}
 # extra variables on every node, applied after launch/lumi_env.sh (which explains every variable), e.g.
@@ -91,10 +92,14 @@ env: {}
 judge:                            # judge configs only (entrypoint skyrl_extensions.judge.entrypoint)
   # On-policy single-step RL with the reward from a judge model: rows with env_class "judge" are graded by
   # an LLM behind an OpenAI API instead of a rule. How it works and what is logged: skyrl_extensions/judge/env.py
+  # Harbor (multi-step agent trials): entrypoint skyrl_extensions.harbor_judge.entrypoint (cwd /opt/SkyRL) and a
+  # judge for trials (name: harbor_task). Each finished trial is graded from the agent's session; the verifier's
+  # reward is only logged. How: skyrl_extensions/harbor_judge/generator.py. Example:
+  # configs/harbor/reasoning_gym_tilde_judge.yaml
   name: gsm8k
   # which judge: prompt, answer schema (enforced by vLLM as JSON schema) and reward, in
   # skyrl_extensions/judge/judges.py. gsm8k (0/1, also logs the rule-based reward), science (0..10, the
-  # judge of the offline rollouts)
+  # judge of the offline rollouts), harbor_task (Harbor trials only: 0/1, also logs the verifier's reward)
   nodes: 1
   # judge nodes: added to the Slurm allocation after the layout nodes, outside Ray. Each runs
   # gpus_per_node / tp independent `vllm serve` processes (launch/job.sbatch role judge); requests go
@@ -126,7 +131,15 @@ judge:                            # judge configs only (entrypoint skyrl_extensi
   # skyrl.environment.skyrl_gym.max_env_workers = judge requests in flight, and for long prompts
   # skyrl.trainer.max_prompt_length (default 512: longer prompts are dropped at load time)
 
-harbor_env:                       # Harbor configs only: the environment-plane job (launch/harbor_env.sbatch)
+harbor_env:                       # Harbor configs only: where the trials' sandboxes run
+  sandboxes: lumi
+  # lumi:  apptainer instances in the environment-plane job (launch/harbor_env.sbatch), every key below.
+  # tilde: Docker containers on the Tilde server (root, internet). No environment-plane job: the training job runs
+  #        the bridge (launch/harbor_bridge.py: marin-harbor's server.py behind a per-run secret) and waits for
+  #        tilde/harbor_workers.sh on Tilde, which tunnels to it via a login node and runs tilde/docker_worker.py.
+  #        Keys: bridge_port, apptainer_dir (for server.py) and tilde_wait_min only. Example:
+  #        configs/harbor/helloworld_tilde.yaml
+  tilde_wait_min: 30              # tilde: minutes the job waits for workers offering max_concurrency slots
   submit: true                    # false: reuse another run's env job; point bridge_file at its run dir
   bridge_file: ${derived.run_dir}/bridge.url
   slurm: {partition: dev-g, nodes: 1, cpus_per_task: 16, mem: 32G, time: "${slurm.time}"}

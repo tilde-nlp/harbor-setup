@@ -8,7 +8,9 @@
 # SkyRL + FSDP on LUMI, for every task. One file, five roles, selected by the second argument:
 #
 #   batch   (default) sbatch runs this on the first node of the allocation. For Harbor, waits for
-#           the environment plane's bridge. Computes RAY_ADDRESS, starts one `node` task per node.
+#           the environment plane's bridge (sandboxes on LUMI), or starts the bridge itself and waits for
+#           the Docker workers on Tilde (harbor_env.sandboxes: tilde). Computes RAY_ADDRESS, starts one
+#           `node` task per node.
 #   node    one task per node, on the host (outside the container). Asserts the GPU count,
 #           stages the checkpoint to /tmp, enters the container and runs `inner`.
 #           On the last JUDGE_NODES nodes (configs with a judge: section): stages the judge model
@@ -75,6 +77,49 @@ watchdog() {
   done
 }
 
+# Harbor with sandboxes on Tilde (harbor_env.sandboxes: tilde). No environment-plane job: the bridge (marin-harbor's
+# server.py behind a per-run secret, launch/harbor_bridge.py) runs here on the batch host, next to the trials, and
+# the Docker workers on Tilde reach it through an ssh tunnel via a login node (tilde/harbor_workers.sh, which
+# finds it in $BRIDGE_FILE). The URL in that file carries the secret: readable only by you, removed when the job
+# ends, which is also how the Tilde side learns that the run is over. A bridge that dies cancels the job: every
+# trial would fail and be masked, and the run would go on training on nothing.
+start_tilde_bridge() {
+  local ip token log="$RUN_DIR/harbor_bridge-$SLURM_JOB_ID.log"
+  ip=$(ip -4 -o addr show hsn0 | awk '{print $4}' | cut -d/ -f1)
+  token=$(python3 -c 'import secrets; print(secrets.token_hex(16))')
+  ( umask 077; echo "$token" > "$RUN_DIR/bridge.token" )
+  ( module load cray-python && exec python3 "$CODE_DIR/launch/harbor_bridge.py" --apptainer-dir "$HARBOR_APPTAINER_DIR" \
+      --port "$HARBOR_BRIDGE_PORT" --token-file "$RUN_DIR/bridge.token" ) > "$log" 2>&1 &
+  BRIDGE_PID=$!
+  ( while kill -0 "$BRIDGE_PID" 2>/dev/null; do sleep 30; done
+    echo "FATAL: the Harbor bridge exited (see $log): cancelling the job"; scancel "$SLURM_JOB_ID" ) &
+  BRIDGE_WATCH_PID=$!
+  trap 'kill "$BRIDGE_WATCH_PID" "$BRIDGE_PID" 2>/dev/null || true; rm -f "$BRIDGE_FILE" "$RUN_DIR/bridge.token"' EXIT
+
+  APPTAINER_BRIDGE_URL="http://$ip:$HARBOR_BRIDGE_PORT/$token"
+  export APPTAINER_BRIDGE_URL
+  for _ in $(seq 30); do curl -sf --max-time 5 "$APPTAINER_BRIDGE_URL/status" >/dev/null && break; sleep 1; done
+  curl -sf --max-time 5 "$APPTAINER_BRIDGE_URL/status" >/dev/null || die "bridge failed to start, see $log"
+  ( umask 077; echo "$APPTAINER_BRIDGE_URL" > "$BRIDGE_FILE.tmp" ) && mv "$BRIDGE_FILE.tmp" "$BRIDGE_FILE"
+  echo "harbor bridge: http://$ip:$HARBOR_BRIDGE_PORT/<token>  (full URL in $BRIDGE_FILE, log $log)"
+
+  # Wait for the Tilde workers: free sandbox slots >= generator.rate_limit.max_concurrency. Before Ray starts, so
+  # nothing is loaded while there is nowhere to run a trial. Slots = sum of --max-envs of the workers polling.
+  local slots last=-1 deadline=$(( SECONDS + HARBOR_TILDE_WAIT_MIN * 60 ))
+  echo "waiting up to $HARBOR_TILDE_WAIT_MIN min for Docker workers on Tilde with $HARBOR_MIN_CAPACITY sandbox slots."
+  echo "On Tilde, in this repo:   tilde/harbor_workers.sh --lumi-run $RUN_DIR"
+  while :; do
+    slots=$(curl -sf --max-time 5 "$APPTAINER_BRIDGE_URL/status" | python3 -c 'import json, sys
+s = json.load(sys.stdin)
+print(sum(n.get("capacity") or 0 for n in s.get("nodes", {}).values() if n.get("active")))' 2>/dev/null) || slots=0
+    (( slots >= HARBOR_MIN_CAPACITY )) && break
+    [ "$slots" = "$last" ] || { echo "  Tilde workers: $slots/$HARBOR_MIN_CAPACITY sandbox slots"; last=$slots; }
+    (( SECONDS < deadline )) || die "no Tilde workers with $HARBOR_MIN_CAPACITY slots after $HARBOR_TILDE_WAIT_MIN min (have $slots). Start tilde/harbor_workers.sh on Tilde (above), or lower generator.rate_limit.max_concurrency / raise its --max-envs"
+    sleep 10
+  done
+  echo "Tilde workers ready: $slots sandbox slots"
+}
+
 role_batch() {
   scontrol show job "$SLURM_JOB_ID" > "$RUN_DIR/slurm_job.txt"
   watchdog "$RUN_DIR/slurm-$SLURM_JOB_ID.out" $(( ${HANG_TIMEOUT_MIN:-15} * 60 )) 60 &
@@ -83,7 +128,9 @@ role_batch() {
 
   # TERM (scancel, time limit) becomes a normal exit, so the EXIT trap below always runs.
   trap 'exit 143' TERM INT HUP
-  if (( HARBOR )); then
+  if (( HARBOR )) && [ "${HARBOR_SANDBOXES:-lumi}" = tilde ]; then
+    start_tilde_bridge
+  elif (( HARBOR )); then
     # The Harbor environment plane (launch/harbor_env.sbatch) is its own job. submit.sh starts it
     # first and records its id; it ends with this job, whatever the reason.
     if [ -s "$RUN_DIR/harbor_env.jobid" ]; then

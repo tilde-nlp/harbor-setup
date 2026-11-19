@@ -8,7 +8,9 @@
 #    rules, and writes a run dir: <paths.runs>/<timestamp>-<config name>/
 # 2. this repo's launch/, configs/, skyrl_extensions/ and checks/ are copied into <run dir>/code (plus git
 #    state), so the job runs exactly what was submitted
-# 3. harbor configs: the environment plane job is submitted first, the training job after it
+# 3. harbor configs: the environment plane job is submitted first, the training job after it (sandboxes on
+#    LUMI). With harbor_env.sandboxes: tilde there is no such job: the training job runs the bridge itself and
+#    waits for tilde/harbor_workers.sh on Tilde
 # 4. sbatch launch/job.sbatch <run dir>; Slurm output goes to <run dir>/slurm-<jobid>.out
 #
 # Examples:
@@ -88,3 +90,7 @@ echo "training job: $JOB"
 echo "run dir:      $RUN_DIR   (also $LATEST)"
 echo "log:          $RUN_DIR/slurm-$JOB.out"
 echo "after step 1: ./check.sh run $RUN_DIR"
+if grep -q '^export HARBOR_SANDBOXES=tilde$' "$RUN_DIR/job.env"; then
+  echo "sandboxes:    on Tilde. Start the Docker workers there now (they wait for the job), in tmux:"
+  echo "                tilde/harbor_workers.sh --lumi-run $RUN_DIR"
+fi
