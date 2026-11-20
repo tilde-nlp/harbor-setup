@@ -46,13 +46,15 @@ done
 [ -n "$LUMI_RUN" ] || die "--lumi-run is required: the run dir that ./submit.sh printed on LUMI, or the training job's id"
 [[ "$MAX_ENVS" =~ ^[0-9]+$ && "$NUM_WORKERS" =~ ^[0-9]+$ && "$WAIT_MIN" =~ ^[0-9]+$ ]] \
   || die "--max-envs, --num-workers and --wait take numbers"
-docker info >/dev/null 2>&1 || die "docker not usable by $USER (is the daemon running, are you in the docker group?)"
+say "checking docker"
+timeout 60 docker info >/dev/null 2>&1 || die "docker not usable by $USER (is the daemon running, are you in the docker group?)"
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 8))' || die "python3 >= 3.8 needed"
 command -v setsid >/dev/null || die "setsid not found (util-linux)"
 command -v curl >/dev/null || die "curl not found"
 
 # BatchMode: fail instead of asking for a passphrase. ControlPath=none: test a fresh login, like the tunnel's.
 SSH=(ssh -o BatchMode=yes -o ConnectTimeout=20)
+say "checking ssh to $LUMI_HOST"
 "${SSH[@]}" -o ControlPath=none "$LUMI_HOST" true \
   || die "cannot ssh to $LUMI_HOST without a prompt. Load your key into an agent first: eval \"\$(ssh-agent)\"; ssh-add ~/.ssh/<lumi key> (and accept the host key once with a plain ssh $LUMI_HOST)"
 
@@ -78,6 +80,7 @@ EOF
 }
 
 # --- wait for the job's bridge ---
+say "looking up $LUMI_RUN on $LUMI_HOST"
 SECONDS=0 LAST=""
 while :; do
   INFO=$(lookup) || die "lookup on $LUMI_HOST failed (see above)"

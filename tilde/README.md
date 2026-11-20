@@ -73,12 +73,16 @@ python3 launch/harbor_bridge.py --host 127.0.0.1 --port 29910 --token-file ~/bri
     --apptainer-dir $PWD/marin-harbor/src/harbor/environments/apptainer
 ```
 
-On **Tilde** (in tmux, with the key in an agent). `lumi` may land on any login node, so pin it to the one
-above:
+On **Tilde** (in tmux). `lumi` may land on any login node, so pin it to the one above. Run the check in the
+foreground first: it must print the hostname with no prompt. A new hostname asks to accept its host key, and a
+key that is not in the agent asks for its passphrase. A backgrounded ssh that waits for a prompt competes with the
+shell for the terminal and makes everything lag.
 
 ```
-LOGIN=<that login node, e.g. uan01's full hostname>
-ssh -N -o HostName=$LOGIN -L 127.0.0.1:18910:127.0.0.1:29910 lumi &
+LOGIN=lumi-uan03.csc.fi   # if `hostname` printed uan03; the bare name only resolves inside LUMI, no user@ here
+ssh -o HostName=$LOGIN lumi hostname   # prints uan03; answer `yes` to the host key once
+# asked for a passphrase? load the key, then repeat the check:  eval $(ssh-agent); ssh-add
+ssh -f -N -o ExitOnForwardFailure=yes -o HostName=$LOGIN -L 127.0.0.1:18910:127.0.0.1:29910 lumi
 TOKEN=$(ssh -o HostName=$LOGIN lumi cat bridge-test.token)
 HB_BRIDGE_URL=http://127.0.0.1:18910/$TOKEN python3 tilde/docker_worker.py --max-envs 2 --run-label bridgetest
 ```
@@ -90,7 +94,7 @@ curl -s http://127.0.0.1:29910/$(cat ~/bridge-test.token)/status | python3 -m js
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:29910/wrong-token/status            # 404
 ```
 
-Then stop everything: Ctrl-C the worker, `kill %1` the tunnel, Ctrl-C the bridge, `rm ~/bridge-test.token`.
+Then stop everything: Ctrl-C the worker, `pkill -f 'L 127.0.0.1:18910'` (the tunnel), Ctrl-C the bridge, `rm ~/bridge-test.token`.
 
 **Pass:** the worker log has no `bridge unreachable`, `/status` shows the worker with capacity 2, and a wrong
 token gets 404.
