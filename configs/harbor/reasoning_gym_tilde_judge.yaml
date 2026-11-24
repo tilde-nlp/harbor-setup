@@ -81,7 +81,7 @@ skyrl:
     val_data: ${skyrl.data.train_data}
 
   harbor_trial_config:                    # merged over Harbor's defaults (REFERENCE.yaml)
-    trials_dir: ${paths.root}/trials
+    trials_dir: ${derived.run_dir}/trials
     agent:
       name: terminus-2
       override_timeout_sec: 600           # [Harbor default: 1200] per trial; timed-out trials are masked

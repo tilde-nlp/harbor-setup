@@ -441,7 +441,7 @@ skyrl:
     # Harbor entrypoint only. Harbor's TrialConfig, merged over SkyRL's
     # /opt/SkyRL/examples/train_integrations/harbor/harbor_trial_config/default.yaml (values below are
     # those defaults). SkyRL injects task.path, agent.model_name, agent.kwargs.api_base, session_id
-    trials_dir: ~/trials          # per-trial logs and outputs
+    trials_dir: ${derived.run_dir}/trials  # per-trial logs and outputs (keep them in the run dir)
     timeout_multiplier: 1.0
     agent:
       name: terminus-2
