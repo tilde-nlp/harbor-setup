@@ -9,6 +9,8 @@
 # The expected answers are in each task's tests/test.sh: do not report scores on tasks that were trained on.
 # 2 policy nodes (SP=4, DP=4) + 2 vLLM nodes (TP=4, 4 engines). Step-wise GRPO, 16 tasks x 4 samples = 64 trials
 # per step, 32 at a time: Tilde needs 32 sandbox slots (1 CPU, 4 GB each: ~32 CPUs, ~128 GB RAM).
+# Chat template: tildeopen_simple_sft.jinja (this repo), the format TildeOpen was SFT'd on; no thinking,
+# so no enable_thinking. It renders every turn as-is, so step-wise prefixes stay consistent.
 # One Slurm job: it runs the bridge itself and waits for the Docker workers on Tilde. Order:
 #
 #   LUMI:   ./submit.sh [--dry-run] configs/harbor/dabstep_tilde.yaml [key.path=value ...]
@@ -77,9 +79,6 @@ skyrl:
         record_terminal_session: false
         llm_kwargs:
           max_tokens: ${skyrl.generator.sampling_params.max_generate_length}
-          extra_body:
-            chat_template_kwargs:
-              enable_thinking: true
         model_info:
           max_input_tokens: ${derived.max_input_tokens}
           max_output_tokens: ${skyrl.generator.sampling_params.max_generate_length}
@@ -142,7 +141,7 @@ skyrl:
       max_num_batched_tokens: 16384       # [SkyRL default: 8192]
       engine_init_kwargs:
         max_model_len: ${derived.max_model_len}
-        chat_template: /opt/SkyRL/skyrl/train/utils/templates/qwen3_acc_thinking.jinja2
+        chat_template: ${paths.root}/tildeopen_simple_sft.jinja   # TildeOpen SFT format: <|role|>...<|role|> turns
       router_init_kwargs:
         policy: round_robin               # each engine gets a trajectory at the start
     n_samples_per_prompt: 4               # [SkyRL default: 5]
