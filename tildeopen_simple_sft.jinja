@@ -1,0 +1,11 @@
+{#- Current TildeOpen SFT: the same <|role|> tag opens and closes a turn, no newlines. -#}
+{#- No tool SFT: terminus-2 JSON actions stay in assistant content, terminal output goes in user turns. -#}
+{%- for m in messages %}
+    {%- set content = m.content if m.content is string else '' %}
+    {%- if m.role in ['system', 'user', 'assistant'] %}
+        {{- '<|' + m.role + '|>' + content + '<|' + m.role + '|>' }}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|assistant|>' }}
+{%- endif %}

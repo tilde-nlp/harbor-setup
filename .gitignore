@@ -16,6 +16,7 @@
 !/tilde/
 !/notebooks/
 !/check.sh
+!/tildeopen_simple_sft.jinja
 /checks/results/
 
 __pycache__/
