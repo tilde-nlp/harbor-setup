@@ -1,0 +1,158 @@
+# Harbor on DABstep (adyen/dabstep, 450 data-analysis tasks: 72 easy, 378 hard) with the sandboxes on Tilde:
+# agentic multi-turn RL (terminus-2 agent), each trial's container in Docker on the Tilde server, reward from the
+# task's own tests (the official DABstep fuzzy scorer on /app/answer.txt).
+# All 450 tasks share one Dockerfile (ubuntu + pandas). Its build downloads the context files (payments.csv,
+# fees.json, manual.md, ...) from Hugging Face, so Tilde needs internet for the first build; the image is cached.
+# The tasks are git-ignored: download them once into <root>/tasks/dabstep (as in setup/HARBOR_TASKS.md):
+#   singularity exec -B /pfs,/scratch multitorch_sandbox.sif bash -c '. /opt/venv/bin/activate
+#     cd tasks && harbor datasets download adyen/dabstep'
+# The expected answers are in each task's tests/test.sh: do not report scores on tasks that were trained on.
+# Small-model test of dabstep_tilde.yaml: Qwen3-4B-Instruct-2507 instead of TildeOpen-30B, to make the pipeline
+# fast to test. Model: hub id in paths.hf_home, downloaded once on a login node (compute nodes are offline):
+#   HF_HOME=$PWD/hf singularity exec -B /pfs,/scratch multitorch_sandbox.sif \
+#     bash -c '. /opt/venv/bin/activate; hf download Qwen/Qwen3-4B-Instruct-2507'
+# Non-thinking model: served with its own chat template (no qwen3_acc_thinking override, no enable_thinking).
+# 1 policy node (SP=2, DP=4) + 1 vLLM node (TP=1, 8 engines). Step-wise GRPO, 8 tasks x 4 samples = 32 trials
+# per step, all at once: Tilde needs 32 sandbox slots (1 CPU, 4 GB each: ~32 CPUs, ~128 GB RAM).
+# One Slurm job: it runs the bridge itself and waits for the Docker workers on Tilde. Order:
+#
+#   LUMI:   ./submit.sh [--dry-run] configs/harbor/dabstep_tilde_qwen4b.yaml [key.path=value ...]
+#   Tilde:  tilde/harbor_workers.sh --lumi-run <run dir printed by submit.sh> --max-envs 32   (in tmux; waits for the job)
+#           --max-envs must be >= generator.rate_limit.max_concurrency (default 8: the job would time out waiting)
+#
+# Self-contained. Meaning of every key and SkyRL's defaults: configs/REFERENCE.yaml.
+# SkyRL keys not listed keep the default; [SkyRL default: X] marks a value changed from it.
+
+slurm:
+  account: project_465003062
+  partition: dev-g
+  time: "03:00:00"                        # dev-g maximum; a trial can take up to override_timeout_sec
+  job_name: skyrl-${derived.config_name}
+  cpus_per_task: 56
+  extra: []
+
+paths:
+  root: ${derived.repo_dir}               # this clone, populated by setup.sh
+  sandbox: ${paths.root}/multitorch_sandbox.sif
+  binds: [/var/spool/slurmd, /scratch/project_465003062, /scratch/project_465002038]
+  hf_home: ${paths.root}/hf
+  data: ${paths.root}/data
+  logs: ${paths.root}/logs
+  ckpts: ${paths.root}/ckpts
+  exports: ${paths.root}/exports
+  runs: ${paths.root}/previous_runs
+
+model:
+  path: Qwen/Qwen3-4B-Instruct-2507       # hub id in paths.hf_home; served as Qwen3-4B-Instruct-2507
+  max_model_len_cap: 65536                # the model has 262144; capped as for TildeOpen
+
+layout:
+  gpus_per_node: 8
+  policy_nodes: 1
+  inference_nodes: 1
+  ref_nodes: 0
+  tp: 1                                   # 4B fits one GPU: 8 engines
+  sp: 2                                   # 64k-token micro batches split over 2 GPUs; DP = 8/2 = 4
+  ray_port: 6379
+
+entrypoint:
+  module: examples.train_integrations.harbor.entrypoints.main_harbor
+  cwd: /opt/SkyRL
+
+env: {}
+
+harbor_env:
+  sandboxes: tilde                        # Docker on Tilde (tilde/harbor_workers.sh); the bridge runs in this job
+  bridge_port: 9910
+  apptainer_dir: ${paths.root}/marin-harbor/src/harbor/environments/apptainer   # its server.py is the bridge
+  tilde_wait_min: 30                      # wait this long for Tilde workers with max_concurrency sandbox slots
+
+skyrl:
+  data:
+    train_data: ["${paths.root}/tasks/dabstep"]
+    val_data: ${skyrl.data.train_data}
+
+  harbor_trial_config:                    # merged over Harbor's defaults (REFERENCE.yaml)
+    trials_dir: ${paths.root}/trials
+    agent:
+      name: terminus-2
+      override_timeout_sec: 1800          # [Harbor default: 1200] per trial (= task.toml); timed-out trials are masked
+      kwargs:
+        max_turns: 16                     # [Harbor default: 32] read the docs, inspect the data, compute, answer
+        record_terminal_session: false
+        llm_kwargs:
+          max_tokens: ${skyrl.generator.sampling_params.max_generate_length}
+        model_info:
+          max_input_tokens: ${derived.max_input_tokens}
+          max_output_tokens: ${skyrl.generator.sampling_params.max_generate_length}
+    environment:
+      type: apptainer                     # [Harbor default: daytona] the bridge client: sandboxes are Docker on Tilde
+      override_memory_mb: 4096            # [Harbor default: 1024] docker run --memory on Tilde (= task.toml)
+
+  trainer:
+    strategy: fsdp
+    logprobs_chunk_size: 512              # [SkyRL default: 1024]
+    placement:
+      colocate_all: false                 # [SkyRL default: true] vLLM on its own nodes
+      colocate_policy_ref: false          # [SkyRL default: true]
+      policy_num_nodes: ${layout.policy_nodes}
+      policy_num_gpus_per_node: ${layout.gpus_per_node}
+      ref_num_nodes: ${layout.ref_nodes}
+      ref_num_gpus_per_node: ${layout.gpus_per_node}
+      critic_num_nodes: ${layout.policy_nodes}
+      critic_num_gpus_per_node: ${layout.gpus_per_node}
+    policy:
+      model:
+        path: ${derived.model}
+      sequence_parallel_size: ${layout.sp}
+      fsdp_config:
+        fsdp_size: ${derived.policy_gpus}
+      optimizer_config:
+        lr: 1.0e-6
+    ref:
+      sequence_parallel_size: ${layout.sp}
+    algorithm:
+      advantage_estimator: grpo
+      loss_reduction: token_mean
+      use_kl_loss: false                  # [SkyRL default: true] no reference model
+      max_seq_len: ${derived.max_model_len}   # required by the Harbor entrypoint
+
+    epochs: 1
+    train_batch_size: 8                   # [SkyRL default: 1024] distinct prompts per step
+    policy_mini_batch_size: 8             # [SkyRL default: 256] prompts per optimizer step (one update per step: on-policy)
+    max_tokens_per_microbatch: 65536      # [SkyRL default: -1] token-budget micro batches
+    eval_batch_size: 1                    # [SkyRL default: 1024]
+    eval_before_train: false              # [SkyRL default: true]
+    eval_interval: -1                     # [SkyRL default: 5]
+    ckpt_interval: -1                     # [SkyRL default: 10]
+    resume_mode: null                     # [SkyRL default: latest]
+    ckpt_path: ${paths.ckpts}/${skyrl.trainer.project_name}_${derived.served_name}_ckpt
+    export_path: ${paths.exports}/${skyrl.trainer.project_name}
+    log_path: ${paths.logs}
+    logger: console                       # [SkyRL default: wandb]
+    project_name: harbor
+    run_name: ${skyrl.trainer.project_name}_lumi_${derived.num_nodes}n_${derived.served_name}_sp${layout.sp}_dp${derived.dp}
+
+  generator:
+    inference_engine:
+      num_engines: ${derived.num_engines}
+      tensor_parallel_size: ${layout.tp}
+      distributed_executor_backend: mp    # [SkyRL default: ray] ray may cause errors here
+      served_model_name: ${derived.served_name}
+      gpu_memory_utilization: 0.85        # [SkyRL default: 0.8]
+      max_num_seqs: 4                     # [SkyRL default: 1024] x 8 engines = 32 = max_concurrency; 4 x 64k KV fits
+      max_num_batched_tokens: 16384       # [SkyRL default: 8192]
+      engine_init_kwargs:
+        max_model_len: ${derived.max_model_len}   # no chat_template: the model's own (non-thinking) template
+      router_init_kwargs:
+        policy: round_robin               # each engine gets a trajectory at the start
+    n_samples_per_prompt: 4               # [SkyRL default: 5]
+    apply_overlong_filtering: true        # [SkyRL default: false]
+    step_wise_trajectories: true          # [SkyRL default: false]
+    merge_stepwise_output: true           # [SkyRL default: false]
+    rate_limit:
+      enabled: true                       # [SkyRL default: false]
+      max_concurrency: 32                 # [SkyRL default: null] concurrent trials = sandbox slots the job waits for
+    sampling_params:
+      max_generate_length: 2048           # [SkyRL default: 1024] per LLM call
+      temperature: 1.0
