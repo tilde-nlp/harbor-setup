@@ -286,6 +286,11 @@ skyrl:
       lambd: 1.0                  # GAE only
       gamma: 1.0                  # GAE only
       value_clip: 0.2             # critic only
+      overlong_buffer_len: 0
+      # judge entrypoint only (not SkyRL): DAPO soft overlong punishment, 0 = off. A response longer
+      # than max_generate_length - overlong_buffer_len loses up to overlong_buffer_penalty_factor of its
+      # reward, linearly (DAPO example: 512)
+      overlong_buffer_penalty_factor: 1.0   # judge entrypoint only; the penalty at max_generate_length
       dynamic_sampling:
         type: null                # null, filter (DAPO), replace (POLARIS)
       off_policy_correction:
